@@ -10,6 +10,7 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.models import Model
 from tensorflow.keras.regularizers import L2
 from tensorflow.keras.constraints import max_norm
+from tensorflow.keras import backend as K
 
 SEED = 1
 
