@@ -49,36 +49,90 @@ def attention_block(x, mode):
 
 # -------- EEGNet-like 2D stem --------
 
-def Conv_block_(x, F1=16, kernLength=64, poolSize=7, D=2, in_chans=22,
-                weightDecay=0.009, maxNormV=0.6, dropout=0.3):
+# def Conv_block_(x, F1=16, kernLength=64, poolSize=7, D=2, in_chans=22,
+#                 weightDecay=0.009, maxNormV=0.6, dropout=0.3):
+#     F2 = F1 * D
+#     x = Conv2D(
+#         F1, (kernLength, 1), padding="same", data_format="channels_last",
+#         kernel_regularizer=L2(weightDecay),
+#         kernel_constraint=max_norm(maxNormV, axis=[0, 1, 2]),
+#         use_bias=False
+#     )(x)
+#     x = BatchNormalization(axis=-1)(x)
+#     x = DepthwiseConv2D(
+#         (1, in_chans), depth_multiplier=D, data_format="channels_last",
+#         depthwise_regularizer=L2(weightDecay),
+#         depthwise_constraint=max_norm(maxNormV, axis=[0, 1, 2]),
+#         use_bias=False
+#     )(x)  # width → 1
+#     x = BatchNormalization(axis=-1)(x)
+#     x = Activation("elu")(x)
+#     x = AveragePooling2D((8, 1), data_format="channels_last")(x)
+#     x = Dropout(dropout, seed=SEED)(x)
+#     x = Conv2D(
+#         F2, (16, 1), padding="same", data_format="channels_last", use_bias=False,
+#         kernel_regularizer=L2(weightDecay),
+#         kernel_constraint=max_norm(maxNormV, axis=[0, 1, 2])
+#     )(x)
+#     x = BatchNormalization(axis=-1)(x)
+#     x = Activation("elu")(x)
+#     x = AveragePooling2D((poolSize, 1), data_format="channels_last")(x)
+#     x = Dropout(dropout, seed=SEED)(x)
+#     return x  # [B, T', 1, F2]
+
+
+#%% Convolutional (CV) block used in the original ATCNet model
+def Conv_block_(x, F1=4, kernLength=64, poolSize=8, D=2, in_chans=22,
+                weightDecay=0.009, maxNormV=0.6, dropout=0.1):
+    """
+    Matches the original ATCNet Conv_block exactly in ops/params.
+    Extra args (weightDecay, maxNormV) are accepted for compatibility but unused.
+
+    Input expected: [B, T, C, ?] with channels_last.
+    """
+
+    # Safety: if you used keep_channels / subset, override in_chans to actual width to avoid crash.
+    w = K.int_shape(x)[2]  # width dimension (channels)
+    if w is not None and w != in_chans:
+        in_chans = w
+
     F2 = F1 * D
+
     x = Conv2D(
-        F1, (kernLength, 1), padding="same", data_format="channels_last",
-        kernel_regularizer=L2(weightDecay),
-        kernel_constraint=max_norm(maxNormV, axis=[0, 1, 2]),
+        F1, (kernLength, 1),
+        padding="same",
+        data_format="channels_last",
         use_bias=False
     )(x)
     x = BatchNormalization(axis=-1)(x)
+
     x = DepthwiseConv2D(
-        (1, in_chans), depth_multiplier=D, data_format="channels_last",
-        depthwise_regularizer=L2(weightDecay),
-        depthwise_constraint=max_norm(maxNormV, axis=[0, 1, 2]),
-        use_bias=False
-    )(x)  # width → 1
-    x = BatchNormalization(axis=-1)(x)
-    x = Activation("elu")(x)
-    x = AveragePooling2D((8, 1), data_format="channels_last")(x)
-    x = Dropout(dropout, seed=SEED)(x)
-    x = Conv2D(
-        F2, (16, 1), padding="same", data_format="channels_last", use_bias=False,
-        kernel_regularizer=L2(weightDecay),
-        kernel_constraint=max_norm(maxNormV, axis=[0, 1, 2])
+        (1, in_chans),
+        use_bias=False,
+        depth_multiplier=D,
+        data_format="channels_last",
+        depthwise_constraint=max_norm(1.)
     )(x)
     x = BatchNormalization(axis=-1)(x)
     x = Activation("elu")(x)
+
+    x = AveragePooling2D((8, 1), data_format="channels_last")(x)
+    x = Dropout(dropout)(x)
+
+    x = Conv2D(
+        F2, (16, 1),
+        padding="same",
+        data_format="channels_last",
+        use_bias=False
+    )(x)
+    x = BatchNormalization(axis=-1)(x)
+    x = Activation("elu")(x)
+
     x = AveragePooling2D((poolSize, 1), data_format="channels_last")(x)
-    x = Dropout(dropout, seed=SEED)(x)
-    return x  # [B, T', 1, F2]
+    x = Dropout(dropout)(x)
+
+    return x
+
 
 # -------- Temporal Conv Net --------
 
