@@ -355,9 +355,6 @@ def train_one(
             epochs=args.epochs,
             verbose=0,
             callbacks=cbs,
-            workers=1,
-            use_multiprocessing=False,
-            max_queue_size=1,
         )
     else:
         model.fit(
