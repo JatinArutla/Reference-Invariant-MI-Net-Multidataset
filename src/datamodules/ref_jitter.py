@@ -16,7 +16,7 @@ class RefJitterSequence(Sequence):
         mu=None, sd=None,
         shuffle=True,
         seed: int = 1,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self.seed = int(seed)

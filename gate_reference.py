@@ -20,10 +20,10 @@ Paper-clean fixes integrated here
 import os
 import argparse
 import json
+import glob
 from typing import Dict, List, Tuple
 
 # Determinism knobs (must be set before TF import)
-os.environ.setdefault("TF_DISABLE_LAYOUT_OPTIMIZER", "1")
 os.environ["TF_DISABLE_LAYOUT_OPTIMIZER"] = "1"
 os.environ["TF_DETERMINISTIC_OPS"] = "1"
 os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
@@ -36,8 +36,6 @@ os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 
 import numpy as np
 import tensorflow as tf
-
-tf.config.optimizer.set_experimental_options({"layout_optimizer": False})
 
 tf.keras.backend.set_image_data_format("channels_last")
 try:
@@ -99,6 +97,39 @@ def build_model(args) -> tf.keras.Model:
         return_ssl_feat=False,
     )
 
+
+
+def _resolve_ssl_path(ssl_template: str, subject: int) -> str:
+    """Resolve a subject-specific SSL weights path.
+
+    Supports:
+    - a direct file path
+    - a template with '{sub}' or '{subject}' (format())
+    - a directory path (we pick the latest matching '*sub{subject}_epoch*.weights.h5')
+    """
+    if not ssl_template:
+        return ""
+    try:
+        path = ssl_template.format(sub=subject, subject=subject)
+    except Exception:
+        path = ssl_template
+
+    if os.path.isdir(path):
+        cands = sorted(glob.glob(os.path.join(path, f"*sub{subject}_epoch*.weights.h5")))
+        if not cands:
+            cands = sorted(glob.glob(os.path.join(path, "*.weights.h5")))
+        return cands[-1] if cands else ""
+
+    return path if os.path.exists(path) else ""
+
+
+def _maybe_load_ssl(model: tf.keras.Model, ssl_template: str, subject: int) -> str:
+    """Load SSL-pretrained weights into `model` if provided. Returns resolved path (or '')."""
+    wpath = _resolve_ssl_path(ssl_template, subject)
+    if not wpath:
+        return ""
+    model.load_weights(wpath, by_name=True, skip_mismatch=True)
+    return wpath
 
 def _load_train_and_test(
     args,
@@ -297,6 +328,7 @@ def train_one(
     X_va: np.ndarray,
     y_va: np.ndarray,
     out_dir: str,
+    subject: int,
     *,
     monitor: str,
     extra_cbs=None,
@@ -305,6 +337,9 @@ def train_one(
     ckpt_path = os.path.join(out_dir, "best.weights.h5")
 
     model = build_model(args)
+    ssl_loaded = _maybe_load_ssl(model, args.ssl_weights, subject)
+    if ssl_loaded:
+        print(f"   ↳ loaded SSL weights: {ssl_loaded}")
     model.compile(
         loss=CategoricalCrossentropy(from_logits=args.from_logits),
         optimizer=Adam(learning_rate=args.lr),
@@ -348,7 +383,8 @@ def train_one(
         )
 
     if isinstance(X_tr, KSequence):
-        # Keep single-threaded generator consumption for determinism.
+        # Keras 3 / TF 2.16+: `workers`, `use_multiprocessing`, `max_queue_size` are not
+        # accepted by `fit()`. Sequence iteration is single-process by default.
         model.fit(
             X_tr,
             validation_data=(_reshape_for_model(X_va), y_va),
@@ -481,6 +517,7 @@ def run(args):
                     X_va_fit,
                     y_va_oh,
                     os.path.join(sub_dir, f"train_{cond}"),
+                    subject=sub,
                     monitor=monitor,
                     extra_cbs=extra_cbs,
                 )
@@ -527,6 +564,7 @@ def run(args):
                     X_va,
                     y_va_mix,
                     os.path.join(sub_dir, f"train_{cond}"),
+                    subject=sub,
                     monitor=monitor,
                     extra_cbs=extra_cbs,
                 )
@@ -556,6 +594,7 @@ def run(args):
                     X_va,
                     y_va_oh,
                     os.path.join(sub_dir, f"train_{cond}"),
+                    subject=sub,
                     monitor="val_accuracy",
                     extra_cbs=None,
                 )
@@ -665,6 +704,14 @@ def parse_args():
     p.add_argument("--min_lr", type=float, default=1e-4)
     p.add_argument("--early_stop", action="store_true")
     p.add_argument("--seed", type=int, default=1)
+
+    # SSL init (optional)
+    p.add_argument(
+        "--ssl_weights",
+        type=str,
+        default="",
+        help="Path/template/dir for SSL encoder weights. Example: './results_ssl/LOSO_{sub:02d}' or './results_ssl/LOSO_{sub:02d}/ssl_encoder_sub{sub}_epoch100.weights.h5'",
+    )
 
     return p.parse_args()
 
