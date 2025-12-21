@@ -128,7 +128,8 @@ def _maybe_load_ssl(model: tf.keras.Model, ssl_template: str, subject: int) -> s
     wpath = _resolve_ssl_path(ssl_template, subject)
     if not wpath:
         return ""
-    model.load_weights(wpath, skip_mismatch=True)
+    # model.load_weights(wpath, skip_mismatch=True)
+    model.load_weights(wpath)
     return wpath
 
 def _load_train_and_test(
