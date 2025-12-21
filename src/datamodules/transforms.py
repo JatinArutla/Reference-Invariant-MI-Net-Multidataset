@@ -88,8 +88,10 @@ def apply_reference(
     if m in ("native", "none", ""):
         return X.astype(np.float32, copy=False)
     if m in ("car", "car_full", "car_intersection"):
-        # Note: "car_full" vs "car_intersection" is controlled by channel subsetting
-        return apply_car(X)
+    # SSL passes a single trial as 2D [C,T]; CAR must average over channels (axis=0).
+        if X.ndim == 2:
+            return apply_car(X, channel_axis=0)
+        return apply_car(X, channel_axis=1)
     if m in ("ref", "cz_ref", "channel_ref"):
         if ref_idx is None:
             raise ValueError("ref_idx is required for mode='ref'")
