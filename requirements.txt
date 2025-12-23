@@ -1,0 +1,8 @@
+# Minimal runtime requirements for Kaggle / local GPU.
+# Pin exact versions for camera-ready runs.
+
+numpy>=1.23
+scipy>=1.9
+scikit-learn>=1.2
+tensorflow>=2.16
+tqdm>=4.64

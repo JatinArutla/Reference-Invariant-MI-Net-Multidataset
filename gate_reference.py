@@ -59,6 +59,7 @@ from src.datamodules.bci2a import load_LOSO_pool, load_subject_dependent
 from src.datamodules.transforms import fit_standardizer, apply_standardizer, apply_reference
 from src.datamodules.channels import BCI2A_CH_NAMES, parse_keep_channels, neighbors_to_index_list, name_to_index
 from src.datamodules.ref_jitter import RefJitterSequence
+from src.datamodules.array_sequence import ArraySequence
 from src.models.model import build_atcnet
 
 
@@ -244,6 +245,46 @@ def _make_split_indices(y: np.ndarray, val_ratio: float, seed: int) -> Tuple[np.
     return tr_idx.astype(int), va_idx.astype(int)
 
 
+def _balanced_label_pool(y: np.ndarray, frac: float, seed: int, *, min_per_class: int = 2) -> np.ndarray:
+    """Return a class-balanced labeled pool of indices.
+
+    This simulates a low-label regime in a way that stays fair across methods:
+    - We first choose a labeled pool with ~`frac` of samples per class.
+    - Then we split that labeled pool into train/val.
+
+    Using per-class permutations makes budgets *nested* for a fixed seed:
+    the 10% pool is a subset of the 25% pool, etc.
+    """
+    y = np.asarray(y).astype(int)
+    n = len(y)
+    frac = float(frac)
+    if frac >= 1.0:
+        return np.arange(n, dtype=int)
+    if frac <= 0.0:
+        raise ValueError("--label_frac must be in (0, 1].")
+
+    rng = np.random.RandomState(int(seed))
+    keep = []
+    classes = np.unique(y)
+    for c in classes:
+        idx_c = np.where(y == c)[0]
+        if idx_c.size == 0:
+            continue
+        # Deterministic per-class permutation so budgets are nested.
+        perm = rng.permutation(idx_c)
+        k = int(np.floor(frac * idx_c.size))
+        k = max(int(min_per_class), k)
+        k = min(k, idx_c.size)
+        keep.append(perm[:k])
+
+    if not keep:
+        raise RuntimeError("No samples selected for labeled pool. Check labels and --label_frac.")
+
+    keep = np.concatenate(keep, axis=0).astype(int)
+    rng.shuffle(keep)
+    return keep
+
+
 def _current_channel_names(keep_channels: str | None) -> List[str]:
     keep_idx = parse_keep_channels(keep_channels, all_names=BCI2A_CH_NAMES)
     if keep_idx is None:
@@ -384,29 +425,54 @@ def train_one(
             )
         )
 
+    # ---- Training input wrapper
+    # IMPORTANT: use a deterministic Sequence for *all* conditions.
+    # In earlier versions, jitter used a shuffling Sequence while plain array training used shuffle=False.
+    # That makes comparisons muddy and can inflate jitter baselines.
     if isinstance(X_tr, KSequence):
-        # Keras 3 / TF 2.16+: `workers`, `use_multiprocessing`, `max_queue_size` are not
-        # accepted by `fit()`. Sequence iteration is single-process by default.
-        model.fit(
-            X_tr,
-            validation_data=(_reshape_for_model(X_va), y_va),
-            epochs=args.epochs,
-            verbose=0,
-            callbacks=cbs,
-        )
+        train_in = X_tr
     else:
-        model.fit(
-            _reshape_for_model(X_tr),
-            y_tr,
-            validation_data=(_reshape_for_model(X_va), y_va),
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            shuffle=False,
-            verbose=0,
-            callbacks=cbs,
-        )
+        train_shuffle = bool(getattr(args, "train_shuffle", True))
+        train_in = ArraySequence(X_tr, y_tr, batch_size=args.batch_size, shuffle=train_shuffle, seed=args.seed)
+
+    # Keras 3 / TF 2.16+: `workers`, `use_multiprocessing`, `max_queue_size` are not accepted by `fit()`.
+    model.fit(
+        train_in,
+        validation_data=(_reshape_for_model(X_va), y_va),
+        epochs=args.epochs,
+        verbose=0,
+        callbacks=cbs,
+    )
+
+    # Always save last-epoch weights. This lets you report either "best" (by checkpoint metric) or "last"
+    # in the paper without re-training.
+    last_path = os.path.join(out_dir, "last.weights.h5")
+    model.save_weights(last_path)
+
+    meta = {
+        "best_weights": os.path.abspath(ckpt_path),
+        "last_weights": os.path.abspath(last_path),
+        "ssl_loaded": ssl_loaded,
+        "monitor": monitor,
+        "monitor_mode": mode,
+    }
+    with open(os.path.join(out_dir, "weights_meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
 
     return ckpt_path
+
+
+def _pick_eval_weights(args, train_out_dir: str, best_weights_path: str) -> str:
+    """Select which weights to evaluate.
+
+    - best: whatever ModelCheckpoint produced
+    - last: final-epoch weights saved to `<train_out_dir>/last.weights.h5`
+    """
+    choice = getattr(args, "eval_weights", "best")
+    if choice == "last":
+        last_path = os.path.join(train_out_dir, "last.weights.h5")
+        return last_path if os.path.exists(last_path) else best_weights_path
+    return best_weights_path
 
 
 def eval_one(args, weights_path: str, X_te: np.ndarray, y_te: np.ndarray) -> Tuple[float, float]:
@@ -452,12 +518,38 @@ def run(args):
         args.n_channels = int(X_base.shape[1])
         args.in_samples = int(X_base.shape[2])
 
-        tr_idx, va_idx = _make_split_indices(y_base, args.val_ratio, args.seed)
+        # --- Low-label protocol (optional)
+        # We first choose a labeled pool (balanced per class), then split it into train/val.
+        # This keeps the *total labeled data* bounded by label_frac, avoiding "free labels" in validation.
+        # Keep full-label behavior identical to previous runs (split seed = args.seed).
+        # For low-label (label_frac < 1), we include the subject id so each subject gets a
+        # stable but distinct labeled pool.
+        lf = float(getattr(args, "label_frac", 1.0))
+        split_seed = int(args.seed) if lf >= 1.0 else (int(args.seed) * 1000 + int(sub))
+        labeled_pool = _balanced_label_pool(
+            y_base,
+            frac=lf,
+            seed=split_seed,
+            min_per_class=int(getattr(args, "label_min_per_class", 2)),
+        )
+        tr_rel, va_rel = _make_split_indices(y_base[labeled_pool], args.val_ratio, split_seed)
+        tr_idx = labeled_pool[tr_rel]
+        va_idx = labeled_pool[va_rel]
 
         sub_dir = os.path.join(args.results_dir, f"sub_{sub:02d}")
         os.makedirs(sub_dir, exist_ok=True)
         with open(os.path.join(sub_dir, "splits.json"), "w") as f:
-            json.dump({"train_idx": tr_idx.tolist(), "val_idx": va_idx.tolist()}, f, indent=2)
+            json.dump(
+                {
+                    "label_frac": float(getattr(args, "label_frac", 1.0)),
+                    "label_min_per_class": int(getattr(args, "label_min_per_class", 2)),
+                    "labeled_pool_idx": labeled_pool.tolist(),
+                    "train_idx": tr_idx.tolist(),
+                    "val_idx": va_idx.tolist(),
+                },
+                f,
+                indent=2,
+            )
 
         y_tr_oh = to_categorical(y_base[tr_idx], num_classes=args.n_classes)
         y_va_oh = to_categorical(y_base[va_idx], num_classes=args.n_classes)
@@ -482,6 +574,7 @@ def run(args):
 
                 mu, sd = mu_sd if mu_sd is not None else (None, None)
 
+                train_shuffle = bool(getattr(args, "train_shuffle", True))
                 train_in = RefJitterSequence(
                     X_tr_raw,
                     y_tr_oh,
@@ -492,7 +585,7 @@ def run(args):
                     keep_channels=args.keep_channels,
                     mu=mu,
                     sd=sd,
-                    shuffle=True,
+                    shuffle=train_shuffle,
                     seed=args.seed,
                 )
 
@@ -512,17 +605,19 @@ def run(args):
                 monitor = "val_refmean_acc"
                 extra_cbs = [ValRefMeanAccFromInputs(val_inputs_by_mode, y_va_oh, args.from_logits)]
 
+                train_out_dir = os.path.join(sub_dir, f"train_{cond}")
                 weights_path = train_one(
                     args,
                     train_in,
                     y_tr_oh,
                     X_va_fit,
                     y_va_oh,
-                    os.path.join(sub_dir, f"train_{cond}"),
+                    train_out_dir,
                     subject=sub,
                     monitor=monitor,
                     extra_cbs=extra_cbs,
                 )
+                weights_path = _pick_eval_weights(args, train_out_dir, weights_path)
 
             elif cond == "mix":
                 X_tr_list, X_va_list = [], []
@@ -555,6 +650,7 @@ def run(args):
                     X_va = X_va_raw.astype(np.float32, copy=False)
 
                 monitor = "val_refmean_acc"
+                train_out_dir = os.path.join(sub_dir, f"train_{cond}")
                 # Use reshaped X_va inside callback to avoid reshaping each epoch.
                 X_va_4d = _reshape_for_model(X_va)
                 extra_cbs = [ValRefMeanAccFromSubsets(X_va_4d, y_va_mix, ref_ids_va, n_modes=len(train_modes), from_logits=args.from_logits)]
@@ -565,11 +661,12 @@ def run(args):
                     y_tr_mix,
                     X_va,
                     y_va_mix,
-                    os.path.join(sub_dir, f"train_{cond}"),
+                    train_out_dir,
                     subject=sub,
                     monitor=monitor,
                     extra_cbs=extra_cbs,
                 )
+                weights_path = _pick_eval_weights(args, train_out_dir, weights_path)
 
             else:
                 (Xc_all, yc_all), _ = _load_train_and_test(args, sub, ref_mode_train=cond, ref_mode_test=cond)
@@ -589,17 +686,20 @@ def run(args):
                     X_tr = X_tr_raw.astype(np.float32, copy=False)
                     X_va = X_va_raw.astype(np.float32, copy=False)
 
+                train_out_dir = os.path.join(sub_dir, f"train_{cond}")
+
                 weights_path = train_one(
                     args,
                     X_tr,
                     y_tr_oh,
                     X_va,
                     y_va_oh,
-                    os.path.join(sub_dir, f"train_{cond}"),
+                    train_out_dir,
                     subject=sub,
                     monitor="val_accuracy",
                     extra_cbs=None,
                 )
+                weights_path = _pick_eval_weights(args, train_out_dir, weights_path)
 
             # Evaluate across test reference modes, using the SAME mu_sd (if any)
             y_te_base = None
@@ -700,7 +800,32 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--train_shuffle", action="store_true", help="Shuffle training trials each epoch (deterministically).")
+    p.add_argument("--no-train_shuffle", dest="train_shuffle", action="store_false", help="Disable training shuffle.")
+    p.set_defaults(train_shuffle=True)
+    p.add_argument(
+        "--eval_weights",
+        type=str,
+        default="best",
+        choices=["best", "last"],
+        help="Which checkpoint to evaluate for reporting: best (ModelCheckpoint) or last (final epoch).",
+    )
     p.add_argument("--val_ratio", type=float, default=0.2)
+
+    # low-label protocol (optional)
+    # label_frac=1.0 reproduces full-label behavior and keeps existing commands valid.
+    p.add_argument(
+        "--label_frac",
+        type=float,
+        default=1.0,
+        help="Fraction of labeled training pool to use (balanced per class). Examples: 0.1, 0.25, 0.5, 1.0",
+    )
+    p.add_argument(
+        "--label_min_per_class",
+        type=int,
+        default=2,
+        help="Minimum labeled samples per class in the labeled pool. Must be >=2 to allow a stratified train/val split.",
+    )
     p.add_argument("--patience", type=int, default=50)
     p.add_argument("--plateau_patience", type=int, default=15)
     p.add_argument("--min_lr", type=float, default=1e-4)

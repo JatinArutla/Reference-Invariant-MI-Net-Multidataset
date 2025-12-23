@@ -12,8 +12,6 @@ from tensorflow.keras.regularizers import L2
 from tensorflow.keras.constraints import max_norm
 from tensorflow.keras import backend as K
 
-SEED = 1
-
 # -------- Attention blocks --------
 
 def mha_block(x, key_dim=8, num_heads=2, dropout=0.5, vanilla=True):
@@ -23,7 +21,10 @@ def mha_block(x, key_dim=8, num_heads=2, dropout=0.5, vanilla=True):
     else:
         # locality self-attention
         attn = MultiHeadAttention_LSA(key_dim=key_dim, num_heads=num_heads, dropout=dropout)(x_norm, x_norm)
-    attn = Dropout(0.3, seed=SEED)(attn)
+    # Do not hard-code Dropout seeds.
+    # Training scripts set global seeds via tf.random.set_seed(...), which keeps runs reproducible
+    # while avoiding the subtle pitfall where every Dropout layer uses the same mask each step.
+    attn = Dropout(0.3)(attn)
     return Add()([x, attn])
 
 class MultiHeadAttention_LSA(tf.keras.layers.MultiHeadAttention):
@@ -146,14 +147,14 @@ def TCN_block_(x, input_dim, depth, kernel_size, filters, dropout,
             kernel_constraint=max_norm(maxNormV, axis=[0, 1]),
             padding="causal", kernel_initializer="he_uniform"
         )(a)
-        a = BatchNormalization()(a); a = Activation(activation)(a); a = Dropout(dropout, seed=SEED)(a)
+        a = BatchNormalization()(a); a = Activation(activation)(a); a = Dropout(dropout)(a)
         a = Conv1D(
             filters, kernel_size=kernel_size, dilation_rate=dil, activation="linear",
             kernel_regularizer=L2(weightDecay),
             kernel_constraint=max_norm(maxNormV, axis=[0, 1]),
             padding="causal", kernel_initializer="he_uniform"
         )(a)
-        a = BatchNormalization()(a); a = Activation(activation)(a); a = Dropout(dropout, seed=SEED)(a)
+        a = BatchNormalization()(a); a = Activation(activation)(a); a = Dropout(dropout)(a)
         return a
 
     y = conv(x, 1)
