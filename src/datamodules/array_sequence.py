@@ -3,15 +3,10 @@ from tensorflow.keras.utils import Sequence
 
 
 class ArraySequence(Sequence):
-    """Deterministic mini-batch wrapper for numpy arrays.
+    """Mini-batch wrapper for numpy arrays.
 
-    Keras' built-in `shuffle=True` path can be nondeterministic across versions.
-    This keeps training reproducible while still doing the standard practice of
-    reshuffling sample order each epoch.
-
-    Expects X as [N,C,T] or [N,1,C,T]. Y can be one-hot or class ids.
-    Returns X as [B,1,C,T] because the ATCNet implementation in this repo
-    uses a 2D stem with channel/time arranged that way.
+    Keeps shuffling repeatable across epochs for reproducible runs.
+    Expects X as [N,C,T] or [N,1,C,T]. Output X is always [B,1,C,T].
     """
 
     def __init__(self, X, y, *, batch_size: int, shuffle: bool, seed: int):
@@ -34,8 +29,7 @@ class ArraySequence(Sequence):
     def on_epoch_end(self):
         self.epoch += 1
         if self.shuffle:
-            # Advance RNG by epoch count deterministically.
-            # This avoids relying on global numpy state.
+            # Re-seed per epoch so shuffling is repeatable.
             self.rng = np.random.default_rng(self.seed + self.epoch)
             self.rng.shuffle(self.idx)
 

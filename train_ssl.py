@@ -1,7 +1,6 @@
 # train_ssl.py
-# Self-supervised pretraining for ATCNet on BCI IV-2a
-# - Supports LOSO and subject-dependent (single subject or loop all)
-# - Optional linear / k-NN probes during training
+# Self-supervised pretraining for ATCNet on BCI IV-2a (LOSO or subject-dependent).
+
 
 import os, argparse
 os.environ["TF_DISABLE_LAYOUT_OPTIMIZER"] = "1"
@@ -38,7 +37,7 @@ from src.selfsupervised.views import make_ssl_dataset
 from src.selfsupervised.losses import nt_xent_loss, barlow_twins_loss, vicreg_loss
 
 
-# ----------------- Utils -----------------
+# Helpers
 
 def set_seed(seed: int = 1):
     import random
@@ -63,7 +62,7 @@ def build_encoder(args):
         tcn_activation=args.tcn_activation,
         fuse=args.fuse,
         from_logits=False,
-        return_ssl_feat=True,  # exposes averaged per-window feature as second output
+        return_ssl_feat=True,  # second output is ssl_feat
     )
 
 

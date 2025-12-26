@@ -88,8 +88,7 @@ def apply_reference(
     if m in ("native", "none", ""):
         return X.astype(np.float32, copy=False)
     if m in ("car", "car_full", "car_intersection"):
-        # SSL may pass a single trial as 2D [C,T]. For that case CAR must average over channels
-        # (axis=0). For the usual batched case [N,C,T], channels live on axis=1.
+        # Handle both [C,T] (single trial) and [N,C,T] (batched).
         if X.ndim == 2:
             return apply_car(X, channel_axis=0)
         return apply_car(X, channel_axis=1)

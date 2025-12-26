@@ -3,7 +3,7 @@ import tensorflow as tf
 
 from src.datamodules.transforms import apply_reference
 
-# ----- NumPy augs on [C,T] -----
+# NumPy augs (input [C,T])
 def _amp_add(x, low=1.0, high=4.0):
     a = np.random.uniform(low, high); return x + a
 
@@ -71,9 +71,9 @@ def two_reference_views(
     lap_neighbors: list[list[int]] | None = None,
     with_augs: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Sample two *different* reference transforms as the two SSL views.
+    """Generate two SSL views using different reference transforms.
 
-    Optionally applies the usual time/amplitude augs after re-referencing.
+    If with_augs is True, apply standard augs after re-referencing.
     """
     if len(ref_modes) < 2:
         raise ValueError("ref_modes must contain at least 2 modes")
@@ -85,7 +85,7 @@ def two_reference_views(
         v2, _ = two_random_augs(v2)
     return v1.astype(np.float32, copy=False), v2.astype(np.float32, copy=False)
 
-# ----- tf.data builder -----
+# tf.data builder
 def _two_views_np(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return two_random_augs(x)
 
@@ -105,7 +105,7 @@ def make_ssl_dataset(
 ) -> tf.data.Dataset:
     N, C, T = X.shape
     assert C == n_channels and T == in_samples
-    
+
     Xf = X.astype(np.float32, copy=False)
     ds = tf.data.Dataset.from_tensor_slices(Xf)
     if shuffle:

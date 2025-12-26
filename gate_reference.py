@@ -1,21 +1,14 @@
-"""gate_reference.py
+"""Run reference-mismatch gate benchmarks on BCI Competition IV-2a.
 
-Reference-invariance gate tests for MI-Net.
+Trains ATCNet under one (or mixed) reference mode and evaluates the same weights under
+multiple test reference modes. Also supports per-sample reference-jitter training.
 
-What it does
-- Train a supervised ATCNet model under a chosen training reference scheme.
-- Evaluate the same trained weights under multiple test reference schemes.
-- Optional stronger baselines:
-  - mixed-reference training (concatenation of multiple reference modes)
-  - reference-jitter training (per-sample re-referencing within a batch)
-
-Paper-clean fixes integrated here
-- One stratified train/val split per subject, reused across all conditions.
-- Checkpoint selection monitors the right metric:
-  - single-mode: val_accuracy
-  - mix/jitter: val_refmean_acc (equal-weight mean across test modes)
-- Jitter/mix scalers are fit on the training split only (no leakage).
+Implementation details:
+- One stratified train/val split per subject is reused across all conditions.
+- For mix/jitter runs, checkpointing monitors the mean accuracy across test modes.
+- Standardization is fit on the training split only.
 """
+
 
 import os
 import argparse
@@ -101,12 +94,9 @@ def build_model(args) -> tf.keras.Model:
 
 
 def _resolve_ssl_path(ssl_template: str, subject: int) -> str:
-    """Resolve a subject-specific SSL weights path.
+    """Resolve per-subject SSL weights path.
 
-    Supports:
-    - a direct file path
-    - a template with '{sub}' or '{subject}' (format())
-    - a directory path (we pick the latest matching '*sub{subject}_epoch*.weights.h5')
+    Accepts a direct path, a format template, or a directory (uses latest match).
     """
     if not ssl_template:
         return ""

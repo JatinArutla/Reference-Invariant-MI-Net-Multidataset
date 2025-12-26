@@ -21,9 +21,7 @@ def mha_block(x, key_dim=8, num_heads=2, dropout=0.5, vanilla=True):
     else:
         # locality self-attention
         attn = MultiHeadAttention_LSA(key_dim=key_dim, num_heads=num_heads, dropout=dropout)(x_norm, x_norm)
-    # Do not hard-code Dropout seeds.
-    # Training scripts set global seeds via tf.random.set_seed(...), which keeps runs reproducible
-    # while avoiding the subtle pitfall where every Dropout layer uses the same mask each step.
+    # Use global seeding (tf.random.set_seed) instead of per-layer Dropout seeds.
     attn = Dropout(0.3)(attn)
     return Add()([x, attn])
 
@@ -51,49 +49,17 @@ def attention_block(x, mode):
 
 # -------- EEGNet-like 2D stem --------
 
-# def Conv_block_(x, F1=16, kernLength=64, poolSize=7, D=2, in_chans=22,
-#                 weightDecay=0.009, maxNormV=0.6, dropout=0.3):
-#     F2 = F1 * D
-#     x = Conv2D(
-#         F1, (kernLength, 1), padding="same", data_format="channels_last",
-#         kernel_regularizer=L2(weightDecay),
-#         kernel_constraint=max_norm(maxNormV, axis=[0, 1, 2]),
-#         use_bias=False
-#     )(x)
-#     x = BatchNormalization(axis=-1)(x)
-#     x = DepthwiseConv2D(
-#         (1, in_chans), depth_multiplier=D, data_format="channels_last",
-#         depthwise_regularizer=L2(weightDecay),
-#         depthwise_constraint=max_norm(maxNormV, axis=[0, 1, 2]),
-#         use_bias=False
-#     )(x)  # width → 1
-#     x = BatchNormalization(axis=-1)(x)
-#     x = Activation("elu")(x)
-#     x = AveragePooling2D((8, 1), data_format="channels_last")(x)
-#     x = Dropout(dropout, seed=SEED)(x)
-#     x = Conv2D(
-#         F2, (16, 1), padding="same", data_format="channels_last", use_bias=False,
-#         kernel_regularizer=L2(weightDecay),
-#         kernel_constraint=max_norm(maxNormV, axis=[0, 1, 2])
-#     )(x)
-#     x = BatchNormalization(axis=-1)(x)
-#     x = Activation("elu")(x)
-#     x = AveragePooling2D((poolSize, 1), data_format="channels_last")(x)
-#     x = Dropout(dropout, seed=SEED)(x)
-#     return x  # [B, T', 1, F2]
-
-
-#%% Convolutional (CV) block used in the original ATCNet model
+# Convolutional block (ATCNet)
 def Conv_block_(x, F1=4, kernLength=64, poolSize=8, D=2, in_chans=22,
                 weightDecay=0.009, maxNormV=0.6, dropout=0.1):
-    """
-    Matches the original ATCNet Conv_block exactly in ops/params.
-    Extra args (weightDecay, maxNormV) are accepted for compatibility but unused.
+    """ATCNet EEGNet-style 2D stem.
 
-    Input expected: [B, T, C, ?] with channels_last.
+    Matches the ops/params used in the original implementation.
+    Input: [B, T, C, 1] with channels_last.
     """
 
-    # Safety: if you used keep_channels / subset, override in_chans to actual width to avoid crash.
+
+    # If channels were subset, make in_chans match actual width.
     w = K.int_shape(x)[2]  # width dimension (channels)
     if w is not None and w != in_chans:
         in_chans = w
