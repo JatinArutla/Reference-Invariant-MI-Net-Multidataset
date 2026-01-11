@@ -73,8 +73,13 @@ def load_bci2a_session(
     if laplacian or (ref_mode or "").lower() in (
         "laplacian", "lap", "local",
         "bipolar", "bip", "bipolar_like",
+        "bipolar_edges", "bip_edges", "edges_bipolar",
     ):
-        lap_neighbors = neighbors_to_index_list(all_names=BCI2A_CH_NAMES, keep_names=keep_names)
+        lap_neighbors = neighbors_to_index_list(
+            all_names=BCI2A_CH_NAMES,
+            keep_names=keep_names,
+            sort_by_distance=True,
+        )
 
     X = apply_reference(X, mode=ref_mode, ref_idx=ref_idx, lap_neighbors=lap_neighbors)
     return X, y

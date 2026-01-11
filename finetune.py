@@ -29,6 +29,7 @@ from tensorflow.keras.utils import to_categorical
 
 from src.datamodules.bci2a import load_LOSO_pool, load_subject_dependent
 from src.models.model import build_atcnet
+from src.datamodules.transforms import standardize_instance
 
 def set_seed(seed: int = 1):
     import random
@@ -72,10 +73,14 @@ def build_model(args) -> tf.keras.Model:
     )
 
 def _load_train_val_for_subject(args, sub: int):
+    # Standardization policy
+    std_mode = (args.standardize_mode or ("train" if args.standardize else "none")).lower()
+
     if args.loso:
         (X_src, y_src), _ = load_LOSO_pool(
             args.data_root, sub,
-            n_sub=args.n_sub, ea=args.ea, standardize=args.standardize,
+            n_sub=args.n_sub, ea=args.ea,
+            standardize=(args.standardize if std_mode == "train" else False),
             per_block_standardize=args.per_block_standardize,
             t1_sec=args.t1_sec, t2_sec=args.t2_sec,
             ref_mode=args.data_ref_mode,
@@ -84,6 +89,11 @@ def _load_train_val_for_subject(args, sub: int):
             laplacian=args.laplacian,
         )
         args.n_channels = int(X_src.shape[1])
+
+        # For LOSO, standardize_pair isn't used. If caller wants per-instance standardization,
+        # do it here for the source pool.
+        if std_mode == "instance":
+            X_src = standardize_instance(X_src, robust=bool(args.instance_robust))
         y_oh = to_categorical(y_src, num_classes=args.n_classes)
         X_tr, X_va, y_tr, y_va = train_test_split(
             X_src, y_oh, test_size=args.val_ratio, random_state=args.seed,
@@ -92,7 +102,8 @@ def _load_train_val_for_subject(args, sub: int):
     else:
         (X_tr_raw, y_tr), (X_te_raw, _) = load_subject_dependent(
             args.data_root, sub,
-            ea=args.ea, standardize=args.standardize,
+            ea=args.ea,
+            standardize=(args.standardize if std_mode == "train" else False),
             t1_sec=args.t1_sec, t2_sec=args.t2_sec,
             ref_mode=args.data_ref_mode,
             keep_channels=args.keep_channels,
@@ -100,6 +111,24 @@ def _load_train_val_for_subject(args, sub: int):
             laplacian=args.laplacian,
         )
         args.n_channels = int(X_tr_raw.shape[1])
+
+        if std_mode == "instance":
+            X_tr_raw = standardize_instance(X_tr_raw, robust=bool(args.instance_robust))
+            X_te_raw = standardize_instance(X_te_raw, robust=bool(args.instance_robust))
+
+        # If we disabled loader standardization (std_mode != train) but the user still set
+        # --standardize, interpret that as "fit on train and apply to val" for consistency.
+        # This is mainly used for subject-dependent finetuning where the paper protocol
+        # expects train-fitted stats.
+        if std_mode == "train" and not args.standardize:
+            # Unreachable by construction, but keep explicit.
+            pass
+        elif std_mode == "train" and args.standardize:
+            # Loader already standardized.
+            pass
+        elif std_mode == "none":
+            pass
+
         y_oh = to_categorical(y_tr, num_classes=args.n_classes)
         X_tr, X_va, y_tr, y_va = train_test_split(
             X_tr_raw, y_oh, test_size=args.val_ratio, random_state=args.seed,
@@ -223,7 +252,12 @@ def parse_args():
         "--data_ref_mode",
         type=str,
         default="native",
-        choices=["native", "car", "ref", "laplacian"],
+        choices=[
+            "native", "car", "ref", "laplacian",
+            "bipolar", "bipolar_edges",
+            "gs", "median",
+            "randref",
+        ],
         help="Reference mode applied to loaded data before EA/standardization.",
     )
     p.add_argument(
@@ -246,6 +280,18 @@ def parse_args():
 
     p.add_argument("--ea", action="store_true"); p.add_argument("--no-ea", dest="ea", action="store_false"); p.set_defaults(ea=True)
     p.add_argument("--standardize", action="store_true"); p.add_argument("--no-standardize", dest="standardize", action="store_false"); p.set_defaults(standardize=True)
+    p.add_argument(
+        "--standardize_mode",
+        type=str,
+        default=None,
+        choices=["train", "instance", "none"],
+        help="Override standardization behavior. 'train' uses train-fitted z-score (default). 'instance' standardizes each trial/channel over time. 'none' disables standardization.",
+    )
+    p.add_argument(
+        "--instance_robust",
+        action="store_true",
+        help="Use median/MAD for instance standardization (only when --standardize_mode=instance).",
+    )
     p.add_argument("--per_block_standardize", action="store_true"); p.add_argument("--no-per_block_standardize", dest="per_block_standardize", action="store_false"); p.set_defaults(per_block_standardize=True)
     p.add_argument("--val_ratio", type=float, default=0.2)
     p.add_argument("--loso", action="store_true"); p.add_argument("--no-loso", dest="loso", action="store_false"); p.set_defaults(loso=True)

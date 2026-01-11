@@ -15,6 +15,34 @@ BCI2A_CH_NAMES: List[str] = [
     "POz",
 ]
 
+# Approximate 2D electrode positions for BCI IV-2a channels.
+# These are only used to sort neighbor lists by proximity (for bipolar_nn).
+# Exact coordinates are not critical; relative layout is.
+BCI2A_CH_POS: Dict[str, Tuple[float, float]] = {
+    "Fz": (0.0, 2.0),
+    "FC3": (-1.0, 1.0),
+    "FC1": (-0.5, 1.0),
+    "FCz": (0.0, 1.0),
+    "FC2": (0.5, 1.0),
+    "FC4": (1.0, 1.0),
+    "C5": (-2.0, 0.0),
+    "C3": (-1.0, 0.0),
+    "C1": (-0.5, 0.0),
+    "Cz": (0.0, 0.0),
+    "C2": (0.5, 0.0),
+    "C4": (1.0, 0.0),
+    "C6": (2.0, 0.0),
+    "CP3": (-1.0, -1.0),
+    "CP1": (-0.5, -1.0),
+    "CPz": (0.0, -1.0),
+    "CP2": (0.5, -1.0),
+    "CP4": (1.0, -1.0),
+    "P1": (-0.5, -2.0),
+    "Pz": (0.0, -2.0),
+    "P2": (0.5, -2.0),
+    "POz": (0.0, -3.0),
+}
+
 
 def name_to_index(names: List[str]) -> Dict[str, int]:
     return {n: i for i, n in enumerate(names)}
@@ -87,6 +115,8 @@ def neighbors_to_index_list(
     all_names: List[str],
     keep_names: Optional[List[str]] = None,
     neighbors_by_name: Optional[Dict[str, List[str]]] = None,
+    sort_by_distance: bool = False,
+    positions: Optional[Dict[str, Tuple[float, float]]] = None,
 ) -> List[List[int]]:
     """Build neighbors list-of-lists aligned to the current channel order.
 
@@ -99,8 +129,49 @@ def neighbors_to_index_list(
     current_names = keep_names if keep_names is not None else all_names
     idx = name_to_index(current_names)
 
+    if positions is None:
+        positions = BCI2A_CH_POS
+
     out: List[List[int]] = []
     for ch in current_names:
-        nei_names = neighbors_by_name.get(ch, [])
-        out.append([idx[n] for n in nei_names if n in idx and n != ch])
+        nei_names = [n for n in neighbors_by_name.get(ch, []) if n in idx and n != ch]
+
+        if sort_by_distance and (ch in positions):
+            cx, cy = positions[ch]
+            def _d2(nm: str) -> float:
+                if nm not in positions:
+                    return float("inf")
+                nx, ny = positions[nm]
+                return (cx - nx) ** 2 + (cy - ny) ** 2
+            nei_names = sorted(nei_names, key=_d2)
+
+        out.append([idx[n] for n in nei_names])
     return out
+
+
+def neighbors_to_edge_list(
+    *,
+    all_names: List[str],
+    keep_names: Optional[List[str]] = None,
+    neighbors_by_name: Optional[Dict[str, List[str]]] = None,
+) -> List[Tuple[int, int]]:
+    """Build a deterministic undirected edge list from the neighbor graph.
+
+    Returns a sorted list of (i, j) index pairs with i < j in the *current* channel order.
+    """
+    neigh = neighbors_to_index_list(
+        all_names=all_names,
+        keep_names=keep_names,
+        neighbors_by_name=neighbors_by_name,
+        sort_by_distance=False,
+    )
+    edges = set()
+    for i, ns in enumerate(neigh):
+        for j in ns:
+            a, b = (i, int(j))
+            if a == b:
+                continue
+            if a > b:
+                a, b = b, a
+            edges.add((a, b))
+    return sorted(edges)

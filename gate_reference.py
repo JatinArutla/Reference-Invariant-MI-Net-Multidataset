@@ -49,7 +49,7 @@ from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.utils import Sequence as KSequence
 
 from src.datamodules.bci2a import load_LOSO_pool, load_subject_dependent
-from src.datamodules.transforms import fit_standardizer, apply_standardizer, apply_reference
+from src.datamodules.transforms import fit_standardizer, apply_standardizer, apply_reference, standardize_instance
 from src.datamodules.channels import BCI2A_CH_NAMES, parse_keep_channels, neighbors_to_index_list, name_to_index
 from src.datamodules.ref_jitter import RefJitterSequence
 from src.datamodules.array_sequence import ArraySequence
@@ -286,7 +286,15 @@ def _ref_params_for_modes(args, modes: List[str]):
     cur = _current_channel_names(args.keep_channels)
 
     need_ref = any((m or "").lower() in ("ref", "cz_ref", "channel_ref") for m in modes)
-    need_lap = any((m or "").lower() in ("laplacian", "lap", "local") for m in modes)
+    need_lap = any(
+        (m or "").lower() in (
+            "laplacian", "lap", "local",
+            "bipolar", "bip", "bipolar_like",
+            "bipolar_edges", "bip_edges", "edges_bipolar",
+            "gs", "gram_schmidt",
+        )
+        for m in modes
+    )
 
     ref_idx = None
     if need_ref:
@@ -298,7 +306,7 @@ def _ref_params_for_modes(args, modes: List[str]):
     lap_neighbors = None
     if need_lap:
         # neighbors projected onto current channel ordering
-        lap_neighbors = neighbors_to_index_list(all_names=BCI2A_CH_NAMES, keep_names=cur)
+        lap_neighbors = neighbors_to_index_list(all_names=BCI2A_CH_NAMES, keep_names=cur, sort_by_distance=True)
 
     return ref_idx, lap_neighbors
 
@@ -479,6 +487,10 @@ def run(args):
     set_seed(args.seed)
     os.makedirs(args.results_dir, exist_ok=True)
 
+    std_mode = args.standardize_mode or ("train" if args.standardize else "none")
+    if std_mode not in ("train", "instance", "none"):
+        raise ValueError(f"Invalid standardize mode: {std_mode}")
+
     test_modes = [m.strip() for m in args.test_ref_modes.split(",") if m.strip()]
     if not test_modes:
         raise ValueError("--test_ref_modes must be a comma-separated list (e.g., 'native,car,ref,laplacian').")
@@ -494,6 +506,20 @@ def run(args):
 
     # parse jitter modes (if empty, reuse train_modes)
     jitter_modes = [m.strip() for m in args.jitter_ref_modes.split(",") if m.strip()] if args.jitter_ref_modes else train_modes
+
+    # bipolar_edges changes channel count -> cannot be mixed with other modes in this benchmark.
+    def _is_edges(m: str) -> bool:
+        return (m or "").lower() in ("bipolar_edges", "bip_edges", "edges_bipolar")
+
+    all_modes = list({*test_modes, *train_modes, *jitter_modes})
+    if any(_is_edges(m) for m in all_modes):
+        if not (all(_is_edges(m) for m in test_modes) and all(_is_edges(m) for m in train_modes)):
+            raise ValueError(
+                "bipolar_edges changes channel count and cannot be mixed with other reference modes in gate_reference.py. "
+                "Run a separate edges-only experiment if needed."
+            )
+        if args.jitter_train_refs and not all(_is_edges(m) for m in jitter_modes):
+            raise ValueError("bipolar_edges cannot be used with jitter-mix across multiple modes.")
 
     # output containers
     results: Dict[str, Dict[str, List[float]]] = {c: {tm: [] for tm in test_modes} for c in train_conds}
@@ -555,7 +581,7 @@ def run(args):
                 X_va_raw = X_base[va_idx]
 
                 # Fit scaler on mixed-ref pool from TRAIN split only (no leakage)
-                if args.standardize:
+                if std_mode == "train":
                     X_stats = np.concatenate(
                         [apply_reference(X_tr_raw, mode=m, ref_idx=ref_idx, lap_neighbors=lap_neighbors) for m in jitter_modes],
                         axis=0,
@@ -575,27 +601,34 @@ def run(args):
                     keep_channels=args.keep_channels,
                     mu=mu,
                     sd=sd,
+                    standardize_mode=std_mode,
+                    instance_robust=args.instance_robust,
                     shuffle=train_shuffle,
                     seed=args.seed,
                 )
 
                 # Validation data for Keras + extra metric across modes
-                if mu_sd is not None:
+                if std_mode == "train" and mu_sd is not None:
                     X_va_fit = apply_standardizer(X_va_raw, *mu_sd)
+                elif std_mode == "instance":
+                    X_va_fit = standardize_instance(X_va_raw, robust=args.instance_robust)
                 else:
                     X_va_fit = X_va_raw.astype(np.float32, copy=False)
 
                 val_inputs_by_mode: Dict[str, np.ndarray] = {}
                 for m in test_modes:
                     Xv_m = apply_reference(X_va_raw, mode=m, ref_idx=ref_idx, lap_neighbors=lap_neighbors)
-                    if mu_sd is not None:
+                    if std_mode == "train" and mu_sd is not None:
                         Xv_m = apply_standardizer(Xv_m, *mu_sd)
+                    elif std_mode == "instance":
+                        Xv_m = standardize_instance(Xv_m, robust=args.instance_robust)
                     val_inputs_by_mode[m] = _reshape_for_model(Xv_m)
 
                 monitor = "val_refmean_acc"
                 extra_cbs = [ValRefMeanAccFromInputs(val_inputs_by_mode, y_va_oh, args.from_logits)]
 
                 train_out_dir = os.path.join(sub_dir, f"train_{cond}")
+                args.n_channels = int(X_tr_raw.shape[1])
                 weights_path = train_one(
                     args,
                     train_in,
@@ -631,13 +664,18 @@ def run(args):
                 y_va_mix = np.concatenate([y_va_oh for _ in train_modes], axis=0)
                 ref_ids_va = np.concatenate(ref_ids_va, axis=0)
 
-                if args.standardize:
+                if std_mode == "train":
                     mu_sd = fit_standardizer(X_tr_raw)
                     X_tr = apply_standardizer(X_tr_raw, *mu_sd)
                     X_va = apply_standardizer(X_va_raw, *mu_sd)
+                elif std_mode == "instance":
+                    X_tr = standardize_instance(X_tr_raw, robust=args.instance_robust)
+                    X_va = standardize_instance(X_va_raw, robust=args.instance_robust)
+                    mu_sd = None
                 else:
                     X_tr = X_tr_raw.astype(np.float32, copy=False)
                     X_va = X_va_raw.astype(np.float32, copy=False)
+                    mu_sd = None
 
                 monitor = "val_refmean_acc"
                 train_out_dir = os.path.join(sub_dir, f"train_{cond}")
@@ -645,6 +683,7 @@ def run(args):
                 X_va_4d = _reshape_for_model(X_va)
                 extra_cbs = [ValRefMeanAccFromSubsets(X_va_4d, y_va_mix, ref_ids_va, n_modes=len(train_modes), from_logits=args.from_logits)]
 
+                args.n_channels = int(X_tr.shape[1])
                 weights_path = train_one(
                     args,
                     X_tr,
@@ -668,13 +707,20 @@ def run(args):
                 X_tr_raw = Xc_all[tr_idx]
                 X_va_raw = Xc_all[va_idx]
 
-                if args.standardize:
+                if std_mode == "train":
                     mu_sd = fit_standardizer(X_tr_raw)
                     X_tr = apply_standardizer(X_tr_raw, *mu_sd)
                     X_va = apply_standardizer(X_va_raw, *mu_sd)
+                elif std_mode == "instance":
+                    mu_sd = None
+                    X_tr = standardize_instance(X_tr_raw, robust=args.instance_robust)
+                    X_va = standardize_instance(X_va_raw, robust=args.instance_robust)
                 else:
+                    mu_sd = None
                     X_tr = X_tr_raw.astype(np.float32, copy=False)
                     X_va = X_va_raw.astype(np.float32, copy=False)
+
+                args.n_channels = int(X_tr.shape[1])
 
                 train_out_dir = os.path.join(sub_dir, f"train_{cond}")
 
@@ -700,8 +746,10 @@ def run(args):
                 elif not np.array_equal(y_te, y_te_base):
                     raise RuntimeError(f"Test label/order mismatch for mode '{te_mode}' vs first test mode")
 
-                if mu_sd is not None:
+                if std_mode == "train" and mu_sd is not None:
                     X_te = apply_standardizer(X_te_raw, *mu_sd)
+                elif std_mode == "instance":
+                    X_te = standardize_instance(X_te_raw, robust=args.instance_robust)
                 else:
                     X_te = X_te_raw.astype(np.float32, copy=False)
 
@@ -768,6 +816,19 @@ def parse_args():
     p.add_argument("--standardize", action="store_true")
     p.add_argument("--no-standardize", dest="standardize", action="store_false")
     p.set_defaults(standardize=True)
+
+    # Optional override: if provided, takes precedence over --standardize/--no-standardize.
+    # - train: fit mu/sd on (train) data and apply to train/val/test
+    # - instance: per-trial per-channel standardization (no shared stats)
+    # - none: no standardization
+    p.add_argument(
+        "--standardize_mode",
+        type=str,
+        default=None,
+        choices=["train", "instance", "none"],
+        help="Standardization strategy override.",
+    )
+    p.add_argument("--instance_robust", action="store_true", help="Use median/MAD for instance standardization.")
 
     p.add_argument("--per_block_standardize", action="store_true")
     p.add_argument("--no-per_block_standardize", dest="per_block_standardize", action="store_false")

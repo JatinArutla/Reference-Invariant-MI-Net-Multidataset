@@ -31,6 +31,7 @@ from sklearn.metrics import accuracy_score
 
 from src.datamodules.bci2a import load_LOSO_pool, load_subject_dependent
 from src.datamodules.channels import BCI2A_CH_NAMES, parse_keep_channels, neighbors_to_index_list, name_to_index
+from src.datamodules.transforms import standardize_instance
 from src.models.model import build_atcnet
 from src.models.wrappers import build_ssl_projector
 from src.selfsupervised.views import make_ssl_dataset
@@ -87,8 +88,23 @@ def _prep_ref_view_params(args):
 
     ref_modes = _split_csv(getattr(args, "view_ref_modes", None)) or ["car", "ref"]
     view_mode = (args.view_mode or "aug").lower()
-    need_lap = args.laplacian or any(m.lower() in ("laplacian", "lap", "local") for m in ref_modes)
-    lap_neighbors = neighbors_to_index_list(all_names=BCI2A_CH_NAMES, keep_names=keep_names) if need_lap else None
+    need_lap = args.laplacian or any(
+        m.lower() in (
+            "laplacian", "lap", "local",
+            "bipolar", "bip", "bipolar_like",
+            "bipolar_edges", "bip_edges", "edges_bipolar",
+        )
+        for m in ref_modes
+    )
+    lap_neighbors = (
+        neighbors_to_index_list(
+            all_names=BCI2A_CH_NAMES,
+            keep_names=keep_names,
+            sort_by_distance=True,
+        )
+        if need_lap
+        else None
+    )
 
     return {
         "ref_modes": ref_modes,
@@ -143,20 +159,29 @@ def _probe_now(encoder, X, y, split: float, k: int):
 def run_loso(args):
     ref_params = _prep_ref_view_params(args)
     loss_fn, need_l2norm = _ssl_loss_fn(args)
+    std_mode = (getattr(args, "standardize_mode", None) or ("train" if args.standardize else "none")).lower()
+    if std_mode not in ("train", "instance", "none"):
+        raise ValueError("standardize_mode must be one of: train, instance, none")
     for tgt in range(1, args.n_sub + 1):
         fold_dir = os.path.join(args.results_dir, f"LOSO_{tgt:02d}")
         os.makedirs(fold_dir, exist_ok=True)
 
         (X_src, y_src), (X_tgt, y_tgt) = load_LOSO_pool(
             args.data_root, tgt,
-            n_sub=args.n_sub, ea=args.ea, standardize=args.standardize,
-            per_block_standardize=args.per_block_standardize,
+            n_sub=args.n_sub, ea=args.ea,
+            standardize=(args.standardize if std_mode == "train" else False),
+            per_block_standardize=(args.per_block_standardize if std_mode == "train" else False),
             t1_sec=args.t1_sec, t2_sec=args.t2_sec,
             ref_mode=args.data_ref_mode,
             keep_channels=args.keep_channels,
             ref_channel=args.ref_channel,
             laplacian=args.laplacian,
         )
+
+        if std_mode == "instance":
+            robust = bool(getattr(args, "instance_robust", False))
+            X_src = standardize_instance(X_src, robust=robust)
+            X_tgt = standardize_instance(X_tgt, robust=robust)
 
         # If channel subsetting is active, n_channels changes.
         args.n_channels = int(X_src.shape[1])
@@ -213,15 +238,23 @@ def run_loso(args):
 def run_subject_dependent_one(args, sub: int):
     ref_params = _prep_ref_view_params(args)
     loss_fn, need_l2norm = _ssl_loss_fn(args)
+    std_mode = (getattr(args, "standardize_mode", None) or ("train" if args.standardize else "none")).lower()
+    if std_mode not in ("train", "instance", "none"):
+        raise ValueError("standardize_mode must be one of: train, instance, none")
     (X_tr, y_tr), (X_te, y_te) = load_subject_dependent(
         args.data_root, sub,
-        ea=args.ea, standardize=args.standardize,
+        ea=args.ea, standardize=(args.standardize if std_mode == "train" else False),
         t1_sec=args.t1_sec, t2_sec=args.t2_sec,
         ref_mode=args.data_ref_mode,
         keep_channels=args.keep_channels,
         ref_channel=args.ref_channel,
         laplacian=args.laplacian,
     )
+
+    if std_mode == "instance":
+        robust = bool(getattr(args, "instance_robust", False))
+        X_tr = standardize_instance(X_tr, robust=robust)
+        X_te = standardize_instance(X_te, robust=robust)
 
     # If channel subsetting is active, n_channels changes.
     args.n_channels = int(X_tr.shape[1])
@@ -293,12 +326,33 @@ def parse_args():
     p.add_argument("--t2_sec", type=float, default=6.0)
     p.add_argument("--ea", action="store_true"); p.add_argument("--no-ea", dest="ea", action="store_false"); p.set_defaults(ea=True)
     p.add_argument("--standardize", action="store_true"); p.add_argument("--no-standardize", dest="standardize", action="store_false"); p.set_defaults(standardize=True)
+    p.add_argument(
+        "--standardize_mode",
+        type=str,
+        default=None,
+        choices=["train", "instance", "none"],
+        help="Override standardization behavior. 'train' uses train-fitted z-score (default). 'instance' standardizes each trial/channel over time. 'none' disables standardization.",
+    )
+    p.add_argument(
+        "--instance_robust",
+        action="store_true",
+        help="Use median/MAD for instance standardization (only when --standardize_mode=instance).",
+    )
     p.add_argument("--per_block_standardize", action="store_true"); p.add_argument("--no-per_block_standardize", dest="per_block_standardize", action="store_false"); p.set_defaults(per_block_standardize=True)
 
     # data reference controls (applied at load time, before EA/standardization)
-    p.add_argument("--data_ref_mode", type=str, default="native", choices=["native","car","ref","laplacian"],
+    p.add_argument(
+        "--data_ref_mode",
+        type=str,
+        default="native",
+        choices=[
+            "native", "car", "ref", "laplacian",
+            "bipolar", "bipolar_edges",
+            "gs", "median",
+            "randref",
+        ],
                    help="Fixed reference transform to apply when loading data.")
-    p.add_argument("--keep_channels", type=str, default=None,
+    p.add_argument("--keep_channels", type=str, default="",
                    help="Comma-separated channel names to keep (e.g., 'C3,Cz,C4').")
     p.add_argument("--ref_channel", type=str, default="Cz", help="Channel name for mode='ref' (must exist after keep_channels).")
     p.add_argument("--laplacian", action="store_true", help="Enable Laplacian neighbors (needed for view_mode ref/laplacian).")

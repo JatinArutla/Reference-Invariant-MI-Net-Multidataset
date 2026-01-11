@@ -23,6 +23,7 @@ tf.config.threading.set_inter_op_parallelism_threads(1)
 
 from src.datamodules.bci2a import load_LOSO_pool, load_subject_dependent
 from src.models.model import build_atcnet
+from src.datamodules.transforms import standardize_instance
 
 def set_seed(seed: int = 1):
     import random
@@ -79,12 +80,17 @@ def run(args):
     cms = np.zeros((args.n_sub, args.n_classes, args.n_classes))
     inf_ms = np.zeros(args.n_sub)
 
+    std_mode = (getattr(args, "standardize_mode", None) or ("train" if args.standardize else "none")).lower()
+    if std_mode not in ("train", "instance", "none"):
+        raise ValueError("standardize_mode must be one of: train, instance, none")
+
     for sub in range(1, args.n_sub + 1):
         if args.loso:
             (_, _), (X_tgt, y_tgt) = load_LOSO_pool(
                 args.data_root, sub,
-                n_sub=args.n_sub, ea=args.ea, standardize=args.standardize,
-                per_block_standardize=args.per_block_standardize,
+                n_sub=args.n_sub, ea=args.ea,
+                standardize=(args.standardize if std_mode == "train" else False),
+                per_block_standardize=(args.per_block_standardize if std_mode == "train" else False),
                 t1_sec=args.t1_sec, t2_sec=args.t2_sec,
                 ref_mode=args.data_ref_mode,
                 keep_channels=args.keep_channels,
@@ -94,13 +100,17 @@ def run(args):
         else:
             (_, _), (X_tgt, y_tgt) = load_subject_dependent(
                 args.data_root, sub,
-                ea=args.ea, standardize=args.standardize,
+                ea=args.ea,
+                standardize=(args.standardize if std_mode == "train" else False),
                 t1_sec=args.t1_sec, t2_sec=args.t2_sec,
                 ref_mode=args.data_ref_mode,
                 keep_channels=args.keep_channels,
                 ref_channel=args.ref_channel,
                 laplacian=args.laplacian,
             )
+
+        if std_mode == "instance":
+            X_tgt = standardize_instance(X_tgt, robust=bool(getattr(args, "instance_robust", False)))
 
         # If channel subsetting is active, update n_channels dynamically.
         args.n_channels = int(X_tgt.shape[1])
@@ -163,7 +173,12 @@ def parse_args():
         "--data_ref_mode",
         type=str,
         default="native",
-        choices=["native", "car", "ref", "laplacian"],
+        choices=[
+            "native", "car", "ref", "laplacian",
+            "bipolar", "bipolar_edges",
+            "gs", "median",
+            "randref",
+        ],
         help="Reference mode applied to loaded data before EA/standardization.",
     )
     p.add_argument(
@@ -185,6 +200,18 @@ def parse_args():
     )
     p.add_argument("--ea", action="store_true"); p.add_argument("--no-ea", dest="ea", action="store_false"); p.set_defaults(ea=True)
     p.add_argument("--standardize", action="store_true"); p.add_argument("--no-standardize", dest="standardize", action="store_false"); p.set_defaults(standardize=True)
+    p.add_argument(
+        "--standardize_mode",
+        type=str,
+        default=None,
+        choices=["train", "instance", "none"],
+        help="Override standardization behavior. 'train' uses train-fitted z-score (default). 'instance' standardizes each trial/channel over time. 'none' disables standardization.",
+    )
+    p.add_argument(
+        "--instance_robust",
+        action="store_true",
+        help="Use median/MAD for instance standardization (only when --standardize_mode=instance).",
+    )
     p.add_argument("--per_block_standardize", action="store_true"); p.add_argument("--no-per_block_standardize", dest="per_block_standardize", action="store_false"); p.set_defaults(per_block_standardize=True)
     p.add_argument("--loso", action="store_true"); p.add_argument("--no-loso", dest="loso", action="store_false"); p.set_defaults(loso=True)
 

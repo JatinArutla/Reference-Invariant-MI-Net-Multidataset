@@ -126,11 +126,12 @@ def apply_laplacian(X: np.ndarray, neighbors: list[list[int]]) -> np.ndarray:
 def apply_bipolar(X: np.ndarray, neighbors: list[list[int]]) -> np.ndarray:
     """Bipolar-like derivation that preserves channel count.
 
-    For each channel i, subtract ONE neighbor (the first in neighbors[i])
-    if available:
+    For each channel i, subtract ONE neighbor (the first in neighbors[i]) if available:
         y_i = x_i - x_{neighbors[i][0]}
 
-    This approximates bipolar derivations while keeping a fixed input dimension.
+    Important: for this to behave like a "nearest-neighbor" bipolar, ensure the
+    neighbor lists are sorted by physical proximity (see channels.neighbors_to_index_list
+    with sort_by_distance=True).
     """
     Xf = X.astype(np.float32, copy=False)
     if Xf.ndim == 3:
@@ -156,6 +157,58 @@ def apply_bipolar(X: np.ndarray, neighbors: list[list[int]]) -> np.ndarray:
             Y[i, :] = Xf[i, :] - Xf[j, :]
         return Y.astype(np.float32)
     raise ValueError(f"apply_bipolar expects 2D or 3D array, got {Xf.ndim}D")
+
+
+def _edge_list_from_neighbors(neighbors: list[list[int]]) -> list[tuple[int, int]]:
+    """Deterministic undirected edge list (i<j) from neighbor index lists."""
+    edges = set()
+    for i, ns in enumerate(neighbors):
+        for j in ns:
+            a, b = i, int(j)
+            if a == b:
+                continue
+            if a > b:
+                a, b = b, a
+            edges.add((a, b))
+    return sorted(edges)
+
+
+def apply_bipolar_edges(
+    X: np.ndarray,
+    neighbors: list[list[int]],
+    *,
+    edges: list[tuple[int, int]] | None = None,
+) -> np.ndarray:
+    """Edge-bipolar representation (changes channel count).
+
+    Builds an undirected edge list from the neighbor graph and returns a signal
+    per edge:
+        y_(i,j) = x_i - x_j
+
+    Output shape:
+      - input [N,C,T] -> [N,E,T]
+      - input [C,T]   -> [E,T]
+
+    Note: E != C in general, so this mode cannot be mixed with other reference
+    modes in a single run (e.g., jitter-mix) without additional projection.
+    """
+    Xf = X.astype(np.float32, copy=False)
+    if edges is None:
+        edges = _edge_list_from_neighbors(neighbors)
+
+    if Xf.ndim == 3:
+        N, C, T = Xf.shape
+        Y = np.empty((N, len(edges), T), dtype=np.float32)
+        for k, (i, j) in enumerate(edges):
+            Y[:, k, :] = Xf[:, int(i), :] - Xf[:, int(j), :]
+        return Y
+    if Xf.ndim == 2:
+        C, T = Xf.shape
+        Y = np.empty((len(edges), T), dtype=np.float32)
+        for k, (i, j) in enumerate(edges):
+            Y[k, :] = Xf[int(i), :] - Xf[int(j), :]
+        return Y
+    raise ValueError(f"apply_bipolar_edges expects 2D or 3D array, got {Xf.ndim}D")
 
 
 def apply_random_global_reference(
@@ -227,6 +280,10 @@ def apply_reference(
         if lap_neighbors is None:
             raise ValueError("lap_neighbors is required for mode='bipolar'")
         return apply_bipolar(X, lap_neighbors)
+    if m in ("bipolar_edges", "bip_edges", "edges_bipolar"):
+        if lap_neighbors is None:
+            raise ValueError("lap_neighbors is required for mode='bipolar_edges'")
+        return apply_bipolar_edges(X, lap_neighbors)
     if m in ("randref", "random_ref", "random_global_ref"):
         if rng is None:
             rng = np.random.default_rng(0)
@@ -266,6 +323,43 @@ def fit_standardizer(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 def apply_standardizer(X: np.ndarray, mu: np.ndarray, sd: np.ndarray) -> np.ndarray:
     return ((X.astype(np.float32, copy=False) - mu) / sd).astype(np.float32)
+
+
+def standardize_instance(
+    X: np.ndarray,
+    *,
+    eps: float = 1e-8,
+    robust: bool = False,
+) -> np.ndarray:
+    """Per-trial, per-channel standardization over time.
+
+    This is useful when you want to avoid global train-set mean/var statistics
+    interacting with reference transforms.
+
+    Supports:
+      - [N,C,T] -> [N,C,T]
+      - [C,T]   -> [C,T]
+    """
+    Xf = X.astype(np.float32, copy=False)
+    if Xf.ndim == 3:
+        if robust:
+            med = np.median(Xf, axis=2, keepdims=True)
+            mad = np.median(np.abs(Xf - med), axis=2, keepdims=True)
+            sd = 1.4826 * mad + eps
+            return ((Xf - med) / sd).astype(np.float32)
+        mu = Xf.mean(axis=2, keepdims=True)
+        sd = Xf.std(axis=2, keepdims=True) + eps
+        return ((Xf - mu) / sd).astype(np.float32)
+    if Xf.ndim == 2:
+        if robust:
+            med = np.median(Xf, axis=1, keepdims=True)
+            mad = np.median(np.abs(Xf - med), axis=1, keepdims=True)
+            sd = 1.4826 * mad + eps
+            return ((Xf - med) / sd).astype(np.float32)
+        mu = Xf.mean(axis=1, keepdims=True)
+        sd = Xf.std(axis=1, keepdims=True) + eps
+        return ((Xf - mu) / sd).astype(np.float32)
+    raise ValueError(f"standardize_instance expects 2D or 3D array, got {Xf.ndim}D")
 
 def standardize_pair(X_train: np.ndarray, X_test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if X_train.ndim != X_test.ndim:

@@ -1,7 +1,7 @@
 import numpy as np
 from tensorflow.keras.utils import Sequence
 
-from src.datamodules.transforms import apply_reference
+from src.datamodules.transforms import apply_reference, standardize_instance
 from src.datamodules.channels import BCI2A_CH_NAMES, neighbors_to_index_list
 
 class RefJitterSequence(Sequence):
@@ -14,6 +14,8 @@ class RefJitterSequence(Sequence):
         laplacian=False,
         keep_channels="",
         mu=None, sd=None,
+        standardize_mode: str = "train",
+        instance_robust: bool = False,
         shuffle=True,
         seed: int = 1,
         randref_alpha: float = 1.0,
@@ -26,6 +28,13 @@ class RefJitterSequence(Sequence):
         self.y = y
         self.bs = int(batch_size)
         self.ref_modes = [m.strip().lower() for m in ref_modes if m.strip()]
+
+        # This mode changes channel count; we do not support mixing it in jitter-mix.
+        if any(m in ("bipolar_edges", "bip_edges", "edges_bipolar") for m in self.ref_modes):
+            raise ValueError(
+                "RefJitterSequence does not support bipolar_edges because it changes channel count. "
+                "Run bipolar_edges in single-mode training/eval only."
+            )
         self.ref_channel = ref_channel
         self.shuffle = shuffle
         self.rng = np.random.default_rng(self.seed)
@@ -36,10 +45,22 @@ class RefJitterSequence(Sequence):
         self.current_names = keep_names if keep_names is not None else BCI2A_CH_NAMES
 
         need_lap = laplacian or any(
-            m in ("laplacian", "lap", "local", "bipolar", "bip", "bipolar_like")
+            m in (
+                "laplacian", "lap", "local",
+                "bipolar", "bip", "bipolar_like",
+                "bipolar_edges", "bip_edges", "edges_bipolar",
+            )
             for m in self.ref_modes
         )
-        self.lap_neighbors = neighbors_to_index_list(all_names=BCI2A_CH_NAMES, keep_names=self.current_names) if need_lap else None
+        self.lap_neighbors = (
+            neighbors_to_index_list(
+                all_names=BCI2A_CH_NAMES,
+                keep_names=self.current_names,
+                sort_by_distance=True,
+            )
+            if need_lap
+            else None
+        )
 
         # map ref_channel to index in current channel list
         self.ref_idx = None
@@ -49,7 +70,14 @@ class RefJitterSequence(Sequence):
                 raise ValueError(f"ref_channel '{ref_channel}' not in current channel set")
             self.ref_idx = name_to_i[ref_channel]
 
-        # optional standardization applied AFTER reference transform
+        # Optional standardization applied AFTER reference transform.
+        # - train: use provided mu/sd (computed on training split)
+        # - instance: per-trial standardization over time
+        # - none: no standardization
+        self.standardize_mode = (standardize_mode or "train").lower()
+        if self.standardize_mode not in ("train", "instance", "none"):
+            raise ValueError("standardize_mode must be one of: train, instance, none")
+        self.instance_robust = bool(instance_robust)
         self.mu = mu
         self.sd = sd
 
@@ -91,7 +119,9 @@ class RefJitterSequence(Sequence):
                 rng=rng,
                 randref_alpha=self.randref_alpha,
             )[0]
-            if self.mu is not None:
+            if self.standardize_mode == "instance":
+                xi = standardize_instance(xi, robust=self.instance_robust)
+            elif self.standardize_mode == "train" and self.mu is not None:
                 # mu,sd are [1,C,1]
                 xi = (xi - self.mu[0, :, 0:1]) / self.sd[0, :, 0:1]
             out[i] = xi
