@@ -44,6 +44,23 @@ BCI2A_CH_POS: Dict[str, Tuple[float, float]] = {
 }
 
 
+# Canonical cross-dataset motor-imagery montage (intersection-style baseline).
+#
+# Rationale:
+# - Many MI datasets in MOABB expose slightly different montages.
+# - A fixed intersection montage is the simplest, most reproducible way to ensure
+#   identical network input across datasets.
+# - We intentionally omit channels that are often missing (e.g., FCz in Lee2019_MI
+#   as exposed by MOABB), and we keep a compact motor strip.
+CANON_CHS_18: List[str] = [
+    "Fz",
+    "FC3", "FC1", "FC2", "FC4",
+    "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
+    "CP3", "CP1", "CPz", "CP2", "CP4",
+    "Pz",
+]
+
+
 def name_to_index(names: List[str]) -> Dict[str, int]:
     return {n: i for i, n in enumerate(names)}
 
@@ -56,7 +73,16 @@ def parse_keep_channels(s: str | None, *, all_names: List[str]) -> Optional[List
     """
     if not s:
         return None
-    req = [p.strip() for p in s.split(",") if p.strip()]
+
+    # Allow preset names so notebooks stay readable.
+    key = s.strip().lower()
+    if key in ("canon_chs_18", "canon18", "canon_18", "canon"):
+        req = list(CANON_CHS_18)
+    elif key in ("bci2a", "iv2a", "bci_iv_2a", "full", "all"):
+        req = list(all_names)
+    else:
+        req = [p.strip() for p in s.split(",") if p.strip()]
+
     m = name_to_index(all_names)
     missing = [r for r in req if r not in m]
     if missing:

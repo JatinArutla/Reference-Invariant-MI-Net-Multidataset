@@ -192,6 +192,7 @@ def run_loso(args):
             seed=args.seed,
             deterministic=True,
             view_mode=args.view_mode,
+            aug_policy=args.aug_policy,
             ref_modes=ref_params["ref_modes"],
             ref_idx=ref_params["ref_idx"],
             lap_neighbors=ref_params["lap_neighbors"],
@@ -262,7 +263,10 @@ def run_subject_dependent_one(args, sub: int):
     ds = make_ssl_dataset(
         X_tr, n_channels=args.n_channels, in_samples=args.in_samples,
         batch_size=args.batch_size, shuffle=True,
+        seed=args.seed,
+        deterministic=True,
         view_mode=args.view_mode,
+        aug_policy=args.aug_policy,
         ref_modes=ref_params["ref_modes"],
         ref_idx=ref_params["ref_idx"],
         lap_neighbors=ref_params["lap_neighbors"],
@@ -352,8 +356,15 @@ def parse_args():
             "randref",
         ],
                    help="Fixed reference transform to apply when loading data.")
-    p.add_argument("--keep_channels", type=str, default="",
-                   help="Comma-separated channel names to keep (e.g., 'C3,Cz,C4').")
+    p.add_argument(
+        "--keep_channels",
+        type=str,
+        default="",
+        help=(
+            "Channel subset to keep. Either a comma-separated list of channel names "
+            "or a preset name. Presets: CANON_CHS_18 (Fz, FC3, FC1, FC2, FC4, C5, C3, C1, Cz, C2, C4, C6, CP3, CP1, CPz, CP2, CP4, Pz)."
+        ),
+    )
     p.add_argument("--ref_channel", type=str, default="Cz", help="Channel name for mode='ref' (must exist after keep_channels).")
     p.add_argument("--laplacian", action="store_true", help="Enable Laplacian neighbors (needed for view_mode ref/laplacian).")
 
@@ -379,9 +390,26 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.5)
 
     # SSL view definition
-    p.add_argument("--view_mode", type=str, default="aug", choices=["aug","ref","ref+aug"],
-                   help="How to generate SSL positive pairs.")
-    p.add_argument("--view_ref_modes", type=str, default="car,ref", help="Comma-separated ref modes for view_mode='ref'.")
+    p.add_argument(
+        "--view_mode",
+        type=str,
+        default="aug",
+        choices=["aug", "ref", "ref+aug"],
+        help="How to generate SSL positive pairs.",
+    )
+    p.add_argument(
+        "--aug_policy",
+        type=str,
+        default="light",
+        choices=["light", "aggressive", "legacy"],
+        help="Augmentation strength for view_mode=aug/ref+aug. 'legacy' reproduces the old aggressive defaults.",
+    )
+    p.add_argument(
+        "--view_ref_modes",
+        type=str,
+        default="native,car",
+        help="Comma-separated ref modes for view_mode='ref' or 'ref+aug'.",
+    )
 
     # SSL loss
     p.add_argument("--ssl_loss", type=str, default="nt_xent", choices=["nt_xent","barlow","vicreg"])

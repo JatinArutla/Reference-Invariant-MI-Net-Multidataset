@@ -1,47 +1,98 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Leave-one-reference-out evaluation.
+# Leave-one-reference-out (LOO-ref) runner.
 #
-# IMPORTANT: The base command you pass should NOT include any of:
-#   --train_ref_modes, --test_ref_modes, --jitter_train_refs, --jitter_ref_modes, --results_dir
-# This script will set them.
+# Usage (example):
+#   bash scripts/run_leave_one_ref_out.sh "native,car,laplacian,bipolar,gs,median" \
+#        /path/to/out \
+#        python gate_reference.py --data_root ... --standardize_mode train --no-ea --laplacian --no-loso --epochs 200 --seed 1
 #
-# Usage:
-#   bash scripts/run_leave_one_ref_out.sh "native,car,laplacian,bipolar,gs,median" ./results/loo_ref \
-#     python gate_reference.py --data_root /path/to/BCICIV_2a_mat --no-loso --no-ea
+# What this script enforces:
+# - Base data is always loaded as 'native'.
+# - The *held-out* mode appears ONLY in --test_ref_modes.
+# - Checkpoint selection uses ONLY seen modes (--val_ref_modes excludes held-out).
+# - Keras val_loss uses a single *seen* mode (--val_single_ref_mode), avoiding leakage into LR scheduling.
 
-MODES_CSV=${1:?"Provide comma-separated modes as arg1"}
-RESULTS_BASE=${2:?"Provide results_base directory as arg2"}
-shift 2
-
-if [[ $# -lt 1 ]]; then
-  echo "ERROR: provide base command (e.g., python gate_reference.py --data_root ...)." >&2
-  exit 1
+if [[ $# -lt 3 ]]; then
+  echo "Usage: $0 <CSV_MODES> <OUT_ROOT> <command...>" >&2
+  exit 2
 fi
 
-IFS=',' read -ra MODES <<< "$MODES_CSV"
-mkdir -p "$RESULTS_BASE"
+CSV_MODES="$1"
+OUT_ROOT="$2"
+shift 2
 
-for held in "${MODES[@]}"; do
-  # Build training mode list excluding the held-out mode.
-  train_modes=()
-  for m in "${MODES[@]}"; do
-    if [[ "$m" != "$held" ]]; then
-      train_modes+=("$m")
+mkdir -p "$OUT_ROOT"
+
+# Remaining args form the base command
+CMD=("$@")
+
+IFS=',' read -r -a MODES_ARR <<< "$CSV_MODES"
+
+trim() {
+  local s="$1"
+  # shellcheck disable=SC2001
+  echo "${s}" | sed 's/^ *//; s/ *$//'
+}
+
+join_csv_excluding() {
+  local exclude="$1"
+  local out=""
+  for m in "${MODES_ARR[@]}"; do
+    m="$(trim "$m")"
+    if [[ -z "$m" ]]; then
+      continue
+    fi
+    if [[ "$m" == "$exclude" ]]; then
+      continue
+    fi
+    if [[ -z "$out" ]]; then
+      out="$m"
+    else
+      out+="${out:+,}$m"
     fi
   done
-  train_csv=$(IFS=','; echo "${train_modes[*]}")
+  echo "$out"
+}
 
-  out_dir="$RESULTS_BASE/heldout_${held}"
-  mkdir -p "$out_dir"
-  echo ""
-  echo "===== HELD-OUT=$held  train_modes=$train_csv  results_dir=$out_dir ====="
+first_mode_in_csv() {
+  local csv="$1"
+  IFS=',' read -r -a tmp <<< "$csv"
+  echo "$(trim "${tmp[0]}")"
+}
 
-  "$@" \
-    --results_dir "$out_dir" \
-    --train_ref_modes "$train_csv" \
+for held_raw in "${MODES_ARR[@]}"; do
+  held="$(trim "$held_raw")"
+  if [[ -z "$held" ]]; then
+    continue
+  fi
+
+  train_csv="$(join_csv_excluding "$held")"
+  if [[ -z "$train_csv" ]]; then
+    echo "ERROR: after excluding '$held', no modes remain." >&2
+    exit 3
+  fi
+
+  # Validation single mode must be seen to avoid leakage through ReduceLROnPlateau.
+  # If held-out is 'native', pick the first remaining mode; otherwise use 'native'.
+  if [[ "$held" == "native" ]]; then
+    val_single="$(first_mode_in_csv "$train_csv")"
+  else
+    val_single="native"
+  fi
+
+  run_dir="$OUT_ROOT/heldout_${held}"
+  mkdir -p "$run_dir"
+
+  echo "\n===== LOO-REF: held-out=${held} | train/jitter modes=${train_csv} | val_single=${val_single} =====" >&2
+
+  "${CMD[@]}" \
+    --results_dir "$run_dir" \
+    --train_ref_modes native \
     --jitter_train_refs \
     --jitter_ref_modes "$train_csv" \
-    --test_ref_modes "$held"
+    --test_ref_modes "$held" \
+    --val_ref_modes "$train_csv" \
+    --val_single_ref_mode "$val_single"
 done

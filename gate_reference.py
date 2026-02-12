@@ -507,11 +507,23 @@ def run(args):
     # parse jitter modes (if empty, reuse train_modes)
     jitter_modes = [m.strip() for m in args.jitter_ref_modes.split(",") if m.strip()] if args.jitter_ref_modes else train_modes
 
+    # Validation reference modes (used ONLY for checkpoint selection/early stopping and LR scheduling).
+    # If unset, we fall back to test_modes to preserve the original behavior.
+    val_modes = [m.strip() for m in (args.val_ref_modes or "").split(",") if m.strip()]
+    if (args.mix_train_refs or args.jitter_train_refs) and not val_modes:
+        val_modes = list(test_modes)
+
+    # Single reference mode used to compute Keras' val_loss/val_accuracy (for ReduceLROnPlateau etc.).
+    # Setting this to a *seen* mode avoids leakage in leave-one-reference-out experiments.
+    val_single_mode = (args.val_single_ref_mode or "native").strip()
+    if val_single_mode.lower() == "auto":
+        val_single_mode = (val_modes[0] if val_modes else "native")
+
     # bipolar_edges changes channel count -> cannot be mixed with other modes in this benchmark.
     def _is_edges(m: str) -> bool:
         return (m or "").lower() in ("bipolar_edges", "bip_edges", "edges_bipolar")
 
-    all_modes = list({*test_modes, *train_modes, *jitter_modes})
+    all_modes = list({*test_modes, *train_modes, *jitter_modes, *val_modes, val_single_mode})
     if any(_is_edges(m) for m in all_modes):
         if not (all(_is_edges(m) for m in test_modes) and all(_is_edges(m) for m in train_modes)):
             raise ValueError(
@@ -525,7 +537,7 @@ def run(args):
     results: Dict[str, Dict[str, List[float]]] = {c: {tm: [] for tm in test_modes} for c in train_conds}
 
     # ref params for in-place apply_reference used by jitter scaler/val
-    ref_idx, lap_neighbors = _ref_params_for_modes(args, list({*test_modes, *jitter_modes}))
+    ref_idx, lap_neighbors = _ref_params_for_modes(args, list({*test_modes, *jitter_modes, *val_modes, val_single_mode}))
 
     for sub in range(1, args.n_sub + 1):
         # One split per subject (reused across all conditions)
@@ -607,16 +619,22 @@ def run(args):
                     seed=args.seed,
                 )
 
-                # Validation data for Keras + extra metric across modes
+                # Validation data for Keras + extra metric across modes.
+                # NOTE:
+                # - X_va_fit controls Keras' built-in val_loss/val_accuracy (used by ReduceLROnPlateau).
+                # - val_inputs_by_mode controls the *checkpoint/early-stopping* metric (val_refmean_acc).
+                # For leave-one-reference-out, set --val_ref_modes to the *seen* modes and
+                # --val_single_ref_mode to a *seen* single mode to avoid leakage.
+                X_va_single = apply_reference(X_va_raw, mode=val_single_mode, ref_idx=ref_idx, lap_neighbors=lap_neighbors)
                 if std_mode == "train" and mu_sd is not None:
-                    X_va_fit = apply_standardizer(X_va_raw, *mu_sd)
+                    X_va_fit = apply_standardizer(X_va_single, *mu_sd)
                 elif std_mode == "instance":
-                    X_va_fit = standardize_instance(X_va_raw, robust=args.instance_robust)
+                    X_va_fit = standardize_instance(X_va_single, robust=args.instance_robust)
                 else:
-                    X_va_fit = X_va_raw.astype(np.float32, copy=False)
+                    X_va_fit = X_va_single.astype(np.float32, copy=False)
 
                 val_inputs_by_mode: Dict[str, np.ndarray] = {}
-                for m in test_modes:
+                for m in (val_modes if val_modes else test_modes):
                     Xv_m = apply_reference(X_va_raw, mode=m, ref_idx=ref_idx, lap_neighbors=lap_neighbors)
                     if std_mode == "train" and mu_sd is not None:
                         Xv_m = apply_standardizer(Xv_m, *mu_sd)
@@ -804,7 +822,34 @@ def parse_args():
     p.add_argument("--mix_train_refs", action="store_true", help="Train on a mixture (concatenation) of all train_ref_modes.")
     p.add_argument("--jitter_train_refs", action="store_true", help="Train with per-sample reference jitter (no concatenation).")
     p.add_argument("--jitter_ref_modes", type=str, default="", help="Comma-separated modes used for jitter. If empty, uses train_ref_modes.")
-    p.add_argument("--keep_channels", type=str, default="", help="Comma-separated channel names to keep (intersection baseline).")
+    p.add_argument(
+        "--val_ref_modes",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated reference modes used ONLY for validation metric / checkpoint selection "
+            "when using --mix_train_refs or --jitter_train_refs. If empty, defaults to --test_ref_modes."
+        ),
+    )
+    p.add_argument(
+        "--val_single_ref_mode",
+        type=str,
+        default="native",
+        help=(
+            "Single reference mode used to compute Keras' val_loss/val_accuracy (for ReduceLROnPlateau). "
+            "Use a *seen* mode in leave-one-reference-out experiments to avoid leakage. "
+            "Set to 'auto' to pick the first val_ref_modes entry."
+        ),
+    )
+    p.add_argument(
+        "--keep_channels",
+        type=str,
+        default="",
+        help=(
+            "Channel subset to keep. Either a comma-separated list of channel names or a preset name. "
+            "Presets: CANON_CHS_18 (Fz, FC3, FC1, FC2, FC4, C5, C3, C1, Cz, C2, C4, C6, CP3, CP1, CPz, CP2, CP4, Pz)."
+        ),
+    )
     p.add_argument("--ref_channel", type=str, default="Cz", help="Channel for ref-mode re-referencing.")
     p.add_argument("--laplacian", action="store_true", help="Enable Laplacian neighbor graph.")
 
