@@ -1,358 +1,323 @@
-"""Analyze reference transforms as (approximate) channel-mixing operators.
+#!/usr/bin/env python
+"""Linear-operator geometry for reference transforms.
 
-Why this exists
---------------
-Your main empirical finding is *directionality* and *family structure* in train→test
-transfer across reference modes. One reviewer-grade way to ground that is to show
-the transforms are not just arbitrary "domains" but have very specific linear
-geometry (rank loss, projection-like behavior, subspace relationships).
+Runs once per reference suite and channel set.
+No training run and no data required.
 
-This script computes:
-- Exact linear operator matrices for strictly linear refs: CAR, laplacian, bipolar,
-  randref (fixed weights).
-- Optional *empirical best linear fit* for adaptive refs: GS, median.
-  (These are not strictly linear as implemented in this repo.)
+This script is intentionally strict about what it calls an "operator":
+- CAR, ref-to-channel, Laplacian, bipolar, bipolar_edges, randref are fixed linear maps in channel space.
+- Median reference is nonlinear.
+- Gram-Schmidt in this repo is data-adaptive (alpha depends on inner products within each trial),
+  so it is not representable as a single fixed matrix A that you can analyze once.
 
-Run examples (from repo root)
------------------------------
-python analysis/operator_geometry.py \
-  --ref_modes native,car,laplacian,bipolar,gs,median \
-  --keep_channels CANON_CHS_18 \
-  --out /kaggle/working/operator_geometry.json
+Those non-fixed modes are skipped with an explanation.
 
-To also estimate linear fits for GS/median on real data (slower):
-python analysis/operator_geometry.py \
-  --ref_modes car,laplacian,bipolar,gs,median \
-  --approx_nonlinear_from_data \
-  --data_root /kaggle/input/four-class-motor-imagery-bnci-001-2014 \
-  --subject 1 \
-  --out /kaggle/working/operator_geometry_with_fit.json
+Outputs:
+- <out_dir>/operators.json
+- <out_dir>/rowspace_similarity.json
 """
 
 from __future__ import annotations
 
-import os
-import sys
-
-# Ensure repo root (the directory containing 'src') is on sys.path,
-# even if this script is executed from a nested path after zip extraction.
-_HERE = os.path.abspath(os.path.dirname(__file__))
-_cand = _HERE
-for _ in range(6):
-    if os.path.isdir(os.path.join(_cand, "src")):
-        if _cand not in sys.path:
-            sys.path.insert(0, _cand)
-        break
-    _cand = os.path.dirname(_cand)
-
 import argparse
 import json
-from dataclasses import asdict, dataclass
-from typing import Dict, List, Optional, Tuple
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 import numpy as np
-from scipy.linalg import orth, subspace_angles
 
 from src.datamodules.channels import (
     BCI2A_CH_NAMES,
     parse_keep_channels,
     neighbors_to_index_list,
+    neighbors_to_edge_list,
+    name_to_index,
 )
-from src.datamodules.bci2a import load_subject_dependent
-from src.datamodules.transforms import apply_reference
-
-
-def _parse_modes(s: str) -> List[str]:
-    return [m.strip() for m in s.split(",") if m.strip()]
 
 
 def _car_matrix(C: int) -> np.ndarray:
     I = np.eye(C, dtype=np.float64)
-    ones = np.ones((C, C), dtype=np.float64) / float(C)
-    return I - ones
+    one = np.ones((C, 1), dtype=np.float64)
+    return I - (1.0 / C) * (one @ one.T)
 
 
-def _laplacian_matrix(neighbors: List[List[int]]) -> np.ndarray:
-    C = len(neighbors)
-    A = np.eye(C, dtype=np.float64)
-    for i in range(C):
-        nb = neighbors[i]
-        if not nb:
-            continue
-        w = -1.0 / float(len(nb))
-        for j in nb:
-            A[i, j] += w
-    return A
-
-
-def _bipolar_nn_matrix(neighbors: List[List[int]]) -> np.ndarray:
-    """Dimension-preserving bipolar: each channel subtracts its closest neighbor."""
-    C = len(neighbors)
-    A = np.eye(C, dtype=np.float64)
-    for i in range(C):
-        nb = neighbors[i]
-        if not nb:
-            continue
-        j0 = nb[0]
-        if j0 == i:
-            continue
-        A[i, j0] -= 1.0
-    return A
-
-
-def _randref_matrix(weights: np.ndarray) -> np.ndarray:
-    """randref in this repo: subtract a fixed weighted average from every channel."""
-    w = np.asarray(weights, dtype=np.float64).reshape(-1)
-    C = w.shape[0]
+def _ref_to_channel_matrix(C: int, ref_idx: int) -> np.ndarray:
     I = np.eye(C, dtype=np.float64)
-    return I - np.ones((C, 1), dtype=np.float64) @ w.reshape(1, C)
+    one = np.ones((C, 1), dtype=np.float64)
+    e = np.zeros((C, 1), dtype=np.float64)
+    e[ref_idx, 0] = 1.0
+    return I - (one @ e.T)
 
 
-def _rank(A: np.ndarray, tol: float = 1e-9) -> int:
-    return int(np.linalg.matrix_rank(A, tol=tol))
+def _laplacian_matrix(neighbors: List[List[int]], C: int) -> np.ndarray:
+    A = np.eye(C, dtype=np.float64)
+    for i in range(C):
+        nb = neighbors[i] if neighbors is not None else []
+        if not nb:
+            continue
+        w = 1.0 / float(len(nb))
+        for j in nb:
+            A[i, j] -= w
+    return A
 
 
-def _projection_error(A: np.ndarray) -> float:
-    # ||A^2 - A||_F / ||A||_F
-    num = np.linalg.norm(A @ A - A, ord="fro")
-    den = np.linalg.norm(A, ord="fro") + 1e-12
-    return float(num / den)
+def _bipolar_matrix(neighbors: List[List[int]], C: int) -> np.ndarray:
+    A = np.eye(C, dtype=np.float64)
+    for i in range(C):
+        nb = neighbors[i] if neighbors is not None else []
+        if not nb:
+            continue
+        j = nb[0]
+        A[i, j] -= 1.0
+    return A
 
 
-def _symmetry_error(A: np.ndarray) -> float:
-    num = np.linalg.norm(A - A.T, ord="fro")
-    den = np.linalg.norm(A, ord="fro") + 1e-12
-    return float(num / den)
+def _bipolar_edges_matrix(edges: List[Tuple[int, int]], C: int) -> np.ndarray:
+    E = len(edges)
+    A = np.zeros((E, C), dtype=np.float64)
+    for k, (i, j) in enumerate(edges):
+        A[k, i] = 1.0
+        A[k, j] = -1.0
+    return A
 
 
-def _energy_stats(A: np.ndarray, n: int = 10_000, seed: int = 0) -> Tuple[float, float]:
-    rng = np.random.default_rng(seed)
-    X = rng.standard_normal((A.shape[0], n)).astype(np.float64)
-    y2 = np.sum((A @ X) ** 2, axis=0)
-    x2 = np.sum(X**2, axis=0) + 1e-12
-    r = y2 / x2
-    return float(np.mean(r)), float(np.std(r))
+def _randref_matrix(C: int, *, seed: int = 0, alpha: float = 1.0) -> np.ndarray:
+    rng = np.random.default_rng(int(seed))
+    w = rng.dirichlet(alpha=np.full((C,), float(alpha), dtype=np.float64))
+    I = np.eye(C, dtype=np.float64)
+    one = np.ones((C, 1), dtype=np.float64)
+    return I - (one @ w.reshape(1, -1))
 
 
-def _rowspace_basis(A: np.ndarray) -> np.ndarray:
-    # Row space of A == column space of A^T
-    return orth(A.T)
+def build_operator(
+    mode: str,
+    *,
+    C: int,
+    ref_idx: int | None,
+    lap_neighbors: List[List[int]] | None,
+    bip_neighbors: List[List[int]] | None,
+    edges: List[Tuple[int, int]] | None,
+    randref_seed: int,
+    randref_alpha: float,
+) -> Tuple[np.ndarray | None, str]:
+    m = (mode or "native").lower()
 
+    if m in ("native", "none", ""):
+        return np.eye(C, dtype=np.float64), "ok"
+    if m in ("car", "car_full", "car_intersection"):
+        return _car_matrix(C), "ok"
+    if m in ("ref", "cz_ref", "channel_ref"):
+        if ref_idx is None:
+            return None, "skip: ref_idx is required for mode='ref'"
+        return _ref_to_channel_matrix(C, ref_idx), "ok"
+    if m in ("laplacian", "lap", "local"):
+        if lap_neighbors is None:
+            return None, "skip: lap_neighbors is required for laplacian"
+        return _laplacian_matrix(lap_neighbors, C), "ok"
+    if m in ("bipolar", "bip", "bipolar_like"):
+        if bip_neighbors is None:
+            return None, "skip: bip_neighbors is required for bipolar"
+        return _bipolar_matrix(bip_neighbors, C), "ok"
+    if m in ("bipolar_edges", "bip_edges", "edges_bipolar"):
+        if edges is None:
+            return None, "skip: edges are required for bipolar_edges"
+        return _bipolar_edges_matrix(edges, C), "ok"
+    if m in ("randref", "random_ref", "random_global_ref"):
+        return _randref_matrix(C, seed=randref_seed, alpha=randref_alpha), "ok"
 
-def _subspace_angle_summary(A: np.ndarray, B: np.ndarray) -> Dict[str, float]:
-    QA = _rowspace_basis(A)
-    QB = _rowspace_basis(B)
-    if QA.size == 0 or QB.size == 0:
-        return {"mean_deg": float("nan"), "max_deg": float("nan")}
-    ang = subspace_angles(QA, QB)  # radians
-    ang_deg = ang * (180.0 / np.pi)
-    return {
-        "mean_deg": float(np.mean(ang_deg)),
-        "max_deg": float(np.max(ang_deg)),
-        "k": int(len(ang_deg)),
-    }
+    if m in ("median", "median_ref", "median_reference"):
+        return None, "skip: median reference is nonlinear (not a fixed matrix A)"
+    if m in ("gs", "gram_schmidt", "gram-schmidt"):
+        return None, "skip: Gram-Schmidt here is data-adaptive (A depends on x)"
+    return None, f"skip: unknown mode '{mode}'"
 
 
 @dataclass
-class OperatorStats:
+class OperatorInfo:
     mode: str
-    C: int
+    A: np.ndarray
     rank: int
+    in_dim: int
+    out_dim: int
     null_dim: int
-    proj_err: float
-    sym_err: float
-    energy_mean: float
-    energy_std: float
-
-    # For non-linear modes: how well a single linear operator fits (lower is better)
-    linear_fit_relerr: Optional[float] = None
+    fro_norm: float
+    idempotence_rel: float | None
+    symm_rel: float | None
+    rowspace_basis: np.ndarray
+    singular_values: List[float]
 
 
-def _fit_linear_operator_from_data(
-    *,
-    data_root: str,
-    subject: int,
-    ref_mode: str,
-    keep_channels: Optional[str],
-    laplacian_neighbors: List[List[int]],
-    seed: int,
-    max_trials: int,
-) -> Tuple[np.ndarray, float]:
-    """Fit A that minimizes ||Y - A X||_F over concatenated timepoints.
+def _svd_rank(A: np.ndarray, *, eps: float = 1e-10) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray]:
+    U, s, Vh = np.linalg.svd(A, full_matrices=False)
+    tol = float(eps) * max(A.shape) * float(s[0] if s.size else 1.0)
+    r = int(np.sum(s > tol))
+    return r, U, s, Vh
 
-    This is purely diagnostic. For truly linear transforms, the fit recovers the
-    exact operator (up to noise). For adaptive transforms (gs/median here), this
-    quantifies "how non-linear" they behave on real data.
-    """
 
-    # Load both train + test, then subsample for speed.
-    (Xtr, _ytr), (Xte, _yte) = load_subject_dependent(
-        data_root,
-        subject,
-        ea=False,
-        standardize=False,
-        ref_mode="native",
-        keep_channels=keep_channels,
-        ref_channel="Cz",
-        laplacian=True,
-    )
-    X = np.concatenate([Xtr, Xte], axis=0)
-    if max_trials and X.shape[0] > max_trials:
-        rng = np.random.default_rng(seed)
-        idx = rng.choice(X.shape[0], size=max_trials, replace=False)
-        X = X[idx]
+def _rowspace_basis_from_svd(Vh: np.ndarray, r: int) -> np.ndarray:
+    if r <= 0:
+        return np.zeros((Vh.shape[1], 0), dtype=np.float64)
+    return Vh[:r, :].T.copy()
 
-    # Apply the reference transform to get Y.
-    Y = apply_reference(X, mode=ref_mode, lap_neighbors=laplacian_neighbors)
 
-    # Stack timepoints: X_flat: [C, N*T]
-    Xf = np.transpose(X, (1, 0, 2)).reshape(X.shape[1], -1).astype(np.float64)
-    Yf = np.transpose(Y, (1, 0, 2)).reshape(Y.shape[1], -1).astype(np.float64)
+def _principal_angle_stats(Q1: np.ndarray, Q2: np.ndarray) -> Dict[str, float]:
+    if Q1.size == 0 or Q2.size == 0:
+        return {"mean_sv": 0.0, "min_sv": 0.0, "max_sv": 0.0}
+    M = Q1.T @ Q2
+    sv = np.linalg.svd(M, compute_uv=False)
+    sv = np.clip(sv, 0.0, 1.0)
+    return {"mean_sv": float(np.mean(sv)), "min_sv": float(np.min(sv)), "max_sv": float(np.max(sv))}
 
-    # Solve Y = A X in least squares: A = Y X^T (X X^T)^{-1}
-    XXt = Xf @ Xf.T
-    reg = 1e-6 * np.eye(XXt.shape[0])
-    A = (Yf @ Xf.T) @ np.linalg.inv(XXt + reg)
 
-    # Relative Frobenius error
-    rel = float(np.linalg.norm(Yf - A @ Xf, ord="fro") / (np.linalg.norm(Yf, ord="fro") + 1e-12))
-    return A, rel
+def _idempotence_rel(A: np.ndarray) -> float | None:
+    if A.shape[0] != A.shape[1]:
+        return None
+    denom = float(np.linalg.norm(A, ord="fro")) + 1e-12
+    return float(np.linalg.norm(A @ A - A, ord="fro") / denom)
+
+
+def _symmetry_rel(A: np.ndarray) -> float | None:
+    if A.shape[0] != A.shape[1]:
+        return None
+    denom = float(np.linalg.norm(A, ord="fro")) + 1e-12
+    return float(np.linalg.norm(A - A.T, ord="fro") / denom)
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--ref_modes",
-        type=str,
-        default="car,laplacian,bipolar,gs,median,randref",
-        help="Comma-separated list of modes to analyze.",
-    )
-    ap.add_argument(
-        "--keep_channels",
-        type=str,
-        default=None,
-        help="Comma-separated channel names to keep, or preset CANON_CHS_18.",
-    )
-    ap.add_argument("--out", type=str, default=None, help="Optional JSON output path.")
-    ap.add_argument(
-        "--approx_nonlinear_from_data",
-        action="store_true",
-        help="Fit a best linear operator for gs/median using real data (slow).",
-    )
-    ap.add_argument("--data_root", type=str, default=None, help="Required if --approx_nonlinear_from_data")
-    ap.add_argument("--subject", type=int, default=1, help="Subject for fitting gs/median operators")
-    ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--max_trials", type=int, default=400, help="Subsample for operator fitting")
-    args = ap.parse_args()
+    p = argparse.ArgumentParser("Operator geometry for reference transforms")
+    p.add_argument("--ref_modes", type=str, required=True, help="Comma-separated modes to analyze")
+    p.add_argument("--keep_channels", type=str, default="", help="Preset name or comma-separated channel names")
+    p.add_argument("--ref_channel", type=str, default="Cz", help="Reference channel name for mode='ref'")
+    p.add_argument("--out_dir", type=str, required=True)
+    p.add_argument("--randref_seed", type=int, default=0)
+    p.add_argument("--randref_alpha", type=float, default=1.0)
+    p.add_argument("--eps", type=float, default=1e-10, help="SVD tolerance scale")
+    args = p.parse_args()
 
-    modes = _parse_modes(args.ref_modes)
+    modes = [m.strip() for m in args.ref_modes.split(",") if m.strip()]
+    if not modes:
+        raise ValueError("--ref_modes must be non-empty")
+
     keep_idx = parse_keep_channels(args.keep_channels, all_names=BCI2A_CH_NAMES)
-    if keep_idx is None:
-        keep_names = list(BCI2A_CH_NAMES)
-    else:
-        keep_names = [BCI2A_CH_NAMES[i] for i in keep_idx]
-
-    # Neighbors projected onto kept montage.
-    lap_nb = neighbors_to_index_list(all_names=BCI2A_CH_NAMES, keep_names=keep_names, sort_by_distance=False)
-    bip_nb = neighbors_to_index_list(all_names=BCI2A_CH_NAMES, keep_names=keep_names, sort_by_distance=True)
-
-    op_mats: Dict[str, np.ndarray] = {}
-    stats: List[OperatorStats] = []
-
+    keep_names = [BCI2A_CH_NAMES[i] for i in keep_idx] if keep_idx is not None else list(BCI2A_CH_NAMES)
     C = len(keep_names)
 
-    # Fixed randref weights (deterministic for diagnostics).
-    rng = np.random.default_rng(0)
-    w = rng.random(C).astype(np.float64)
-    w = w / (np.sum(w) + 1e-12)
+    ref_idx = None
+    if any((m or "").lower() in ("ref", "cz_ref", "channel_ref") for m in modes):
+        mp = name_to_index(keep_names)
+        if args.ref_channel in mp:
+            ref_idx = int(mp[args.ref_channel])
+
+    need_lap = any((m or "").lower() in ("laplacian", "lap", "local") for m in modes)
+    need_bip = any((m or "").lower() in ("bipolar", "bip", "bipolar_like", "bipolar_edges", "bip_edges", "edges_bipolar") for m in modes)
+
+    lap_neighbors = None
+    bip_neighbors = None
+    edges = None
+
+    if need_lap or need_bip:
+        lap_neighbors = neighbors_to_index_list(all_names=BCI2A_CH_NAMES, keep_names=keep_names, sort_by_distance=False)
+    if need_bip:
+        bip_neighbors = neighbors_to_index_list(all_names=BCI2A_CH_NAMES, keep_names=keep_names, sort_by_distance=True)
+        edges = neighbors_to_edge_list(all_names=BCI2A_CH_NAMES, keep_names=keep_names, sort_by_distance=True)
+
+    infos: Dict[str, OperatorInfo] = {}
+    skipped: Dict[str, str] = {}
 
     for m in modes:
-        m_key = m.strip().lower()
-        A = None
-        relerr = None
-
-        if m_key in ("car",):
-            A = _car_matrix(C)
-        elif m_key in ("laplacian",):
-            A = _laplacian_matrix(lap_nb)
-        elif m_key in ("bipolar", "bipolar_nn"):
-            A = _bipolar_nn_matrix(bip_nb)
-        elif m_key in ("randref",):
-            A = _randref_matrix(w)
-        elif m_key in ("native",):
-            # "native" is not a transform we apply; treat as identity operator.
-            A = np.eye(C, dtype=np.float64)
-        elif m_key in ("gs", "median"):
-            if args.approx_nonlinear_from_data:
-                if not args.data_root:
-                    raise ValueError("--data_root is required for --approx_nonlinear_from_data")
-                A, relerr = _fit_linear_operator_from_data(
-                    data_root=args.data_root,
-                    subject=args.subject,
-                    ref_mode=m_key,
-                    keep_channels=args.keep_channels,
-                    laplacian_neighbors=lap_nb,
-                    seed=args.seed,
-                    max_trials=args.max_trials,
-                )
-            else:
-                # Skip by default because there is no fixed operator.
-                print(f"[skip] mode '{m_key}' is not strictly linear in this repo. Use --approx_nonlinear_from_data.")
-                continue
-        else:
-            print(f"[skip] unsupported/unknown mode '{m_key}'")
+        A, status = build_operator(
+            m,
+            C=C,
+            ref_idx=ref_idx,
+            lap_neighbors=lap_neighbors,
+            bip_neighbors=bip_neighbors,
+            edges=edges,
+            randref_seed=int(args.randref_seed),
+            randref_alpha=float(args.randref_alpha),
+        )
+        if A is None:
+            skipped[m] = status
             continue
 
-        op_mats[m_key] = A
-        r = _rank(A)
-        mu, sd = _energy_stats(A)
-        stats.append(
-            OperatorStats(
-                ref_mode=m_key,
-                C=C,
-                rank=r,
-                null_dim=C - r,
-                proj_err=_projection_error(A),
-                sym_err=_symmetry_error(A),
-                energy_mean=mu,
-                energy_std=sd,
-                linear_fit_relerr=relerr,
-            )
+        r, U, s, Vh = _svd_rank(A, eps=float(args.eps))
+        Q = _rowspace_basis_from_svd(Vh, r)
+
+        infos[m] = OperatorInfo(
+            mode=m,
+            A=A,
+            rank=int(r),
+            in_dim=int(A.shape[1]),
+            out_dim=int(A.shape[0]),
+            null_dim=int(A.shape[1] - r),
+            fro_norm=float(np.linalg.norm(A, ord="fro")),
+            idempotence_rel=_idempotence_rel(A),
+            symm_rel=_symmetry_rel(A),
+            rowspace_basis=Q,
+            singular_values=[float(x) for x in s.tolist()],
         )
 
-    # Pairwise subspace angles for the operators we computed.
-    pair_angles: Dict[str, Dict[str, Dict[str, float]]] = {}
-    keys = list(op_mats.keys())
-    for i, a in enumerate(keys):
-        pair_angles[a] = {}
-        for b in keys:
-            pair_angles[a][b] = _subspace_angle_summary(op_mats[a], op_mats[b])
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    # Pretty print a compact summary.
-    print("\nOperator stats")
-    print("mode\tC\trank\tnull\tproj_err\tsym_err\tEmean\tEstd\tlinfit_relerr")
-    for s in stats:
-        print(
-            f"{s.mode}\t{s.C}\t{s.rank}\t{s.null_dim}\t"
-            f"{s.proj_err:.3e}\t{s.sym_err:.3e}\t{s.energy_mean:.3f}\t{s.energy_std:.3f}\t"
-            f"{'' if s.linear_fit_relerr is None else f'{s.linear_fit_relerr:.3e}'}"
-        )
-
-    out_obj = {
-        "keep_channels": keep_names,
-        "modes": keys,
-        "operator_stats": [asdict(s) for s in stats],
-        "pairwise_rowspace_angles": pair_angles,
-        "notes": {
-            "gs_median": "In this repo, gs and median are data-adaptive and not strictly linear. Use --approx_nonlinear_from_data to fit an empirical linear operator and quantify non-linearity.",
-            "bipolar": "bipolar here is dimension-preserving nearest-neighbor difference (bipolar_nn).",
+    operators_out = {
+        "meta": {
+            "ref_modes_requested": modes,
+            "ref_modes_analyzed": sorted(list(infos.keys())),
+            "ref_modes_skipped": skipped,
+            "keep_channels": args.keep_channels,
+            "channels": keep_names,
+            "ref_channel": args.ref_channel,
+            "ref_idx": ref_idx,
+            "randref_seed": int(args.randref_seed),
+            "randref_alpha": float(args.randref_alpha),
+            "eps": float(args.eps),
         },
+        "operators": {},
     }
 
-    if args.out:
-        with open(args.out, "w") as f:
-            json.dump(out_obj, f, indent=2)
-        print(f"\nWrote: {args.out}")
+    for m, info in infos.items():
+        operators_out["operators"][m] = {
+            "in_dim": info.in_dim,
+            "out_dim": info.out_dim,
+            "rank": info.rank,
+            "null_dim": info.null_dim,
+            "fro_norm": info.fro_norm,
+            "idempotence_rel": info.idempotence_rel,
+            "symmetry_rel": info.symm_rel,
+            "singular_values": info.singular_values,
+            "A": info.A.tolist(),
+        }
+
+    with open(os.path.join(args.out_dir, "operators.json"), "w") as f:
+        json.dump(operators_out, f, indent=2)
+
+    modes_ok = sorted(list(infos.keys()))
+    sim = {a: {} for a in modes_ok}
+    for a in modes_ok:
+        Qa = infos[a].rowspace_basis
+        for b in modes_ok:
+            Qb = infos[b].rowspace_basis
+            sim[a][b] = _principal_angle_stats(Qa, Qb)
+
+    with open(os.path.join(args.out_dir, "rowspace_similarity.json"), "w") as f:
+        json.dump(
+            {
+                "meta": {
+                    "modes": modes_ok,
+                    "similarity_definition": "principal-angle singular values between row-space bases in input channel space",
+                },
+                "rowspace_similarity": sim,
+            },
+            f,
+            indent=2,
+        )
+
+    print(f"[operator_geometry] wrote: {os.path.join(args.out_dir, 'operators.json')}")
+    print(f"[operator_geometry] wrote: {os.path.join(args.out_dir, 'rowspace_similarity.json')}")
+    if skipped:
+        print("[operator_geometry] skipped modes:")
+        for k, v in skipped.items():
+            print(f"  - {k}: {v}")
 
 
 if __name__ == "__main__":

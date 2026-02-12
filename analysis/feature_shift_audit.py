@@ -1,392 +1,351 @@
-"""Audit how referencing changes basic signal features.
+#!/usr/bin/env python
+"""Feature shift audit for reference transforms.
 
-This is deliberately *not* about improving accuracy.
-It's about making your reference-mismatch story more mechanistic and reviewer-proof.
+Runs on the data only. No model needed.
 
-What it computes (per trial)
----------------------------
-1) Spectral aperiodic slope (log-log PSD fit, 4-40 Hz)
-2) Oscillatory "peak residual" strength in mu (8-13) and beta (13-30)
-3) Bandpower (mu/beta) in selected channels (defaults are motor-region-ish)
-4) Spatial gradient energy proxies (laplacian energy, bipolar energy)
+Goal: show what re-referencing changes in the dataset using simple, mechanistic statistics:
+- bandpower (delta/theta/alpha/beta)
+- 1/f-like PSD slope in 4-30 Hz
+- temporal gradient energy
+- common-mode ratio (energy of channel-mean / total energy)
+- mean absolute inter-channel correlation
 
-It then summarizes each metric per reference mode and outputs pairwise
-"standardized mean shift" distances between modes.
+Important:
+- For a "mechanistic" audit, you usually want --standardize_mode none.
+  Standardization can erase or distort amplitude and spectral shifts.
 
-Run example
------------
-python analysis/feature_shift_audit.py \
-  --data_root /kaggle/input/four-class-motor-imagery-bnci-001-2014 \
-  --subject 1 \
-  --ref_modes native,car,laplacian,bipolar,gs,median \
-  --standardize_mode none \
-  --keep_channels CANON_CHS_18 \
-  --split test \
-  --out_dir /kaggle/working/feature_audit_sub01
-
-Notes
------
-* If you want the analysis to reflect *pure* referencing (not "train-fit" stats),
-  prefer --standardize_mode none or instance.
-* The slope/peak extraction here is a lightweight alternative to FOOOF: it fits a
-  line to log10 PSD vs log10 f and uses residual peaks.
+Outputs in out_dir:
+- meta.json
+- summary.csv  (one row per subject x mode with feature means)
+- per_trial_features_subXX_modeYY.npz  (features per trial, labels)
 """
 
 from __future__ import annotations
-
-import os
-import sys
-
-# Ensure repo root (the directory containing 'src') is on sys.path,
-# even if this script is executed from a nested path after zip extraction.
-_HERE = os.path.abspath(os.path.dirname(__file__))
-_cand = _HERE
-for _ in range(6):
-    if os.path.isdir(os.path.join(_cand, "src")):
-        if _cand not in sys.path:
-            sys.path.insert(0, _cand)
-        break
-    _cand = os.path.dirname(_cand)
 
 import argparse
 import csv
 import json
 import os
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
-from scipy.signal import welch
 
-from src.datamodules.bci2a import load_subject_dependent
 from src.datamodules.channels import (
+    BCI2A_FS,
     BCI2A_CH_NAMES,
     parse_keep_channels,
     neighbors_to_index_list,
     name_to_index,
 )
-from src.datamodules.transforms import apply_reference
+from src.datamodules.bci2a import load_bci2a_session
+from src.datamodules.transforms import (
+    apply_reference,
+    fit_standardizer,
+    apply_standardizer,
+    standardize_instance,
+)
 
 
-def _parse_modes(s: str) -> List[str]:
-    return [m.strip() for m in s.split(",") if m.strip()]
+def _parse_list(s: str) -> List[str]:
+    return [x.strip() for x in (s or "").split(",") if x.strip()]
 
 
-def _parse_list(s: Optional[str]) -> Optional[List[str]]:
-    if s is None:
-        return None
-    out = [x.strip() for x in s.split(",") if x.strip()]
-    return out or None
+def _parse_subjects(s: str, n_sub: int) -> List[int]:
+    s2 = (s or "").strip().lower()
+    if s2 in ("all", "*"):
+        return list(range(1, int(n_sub) + 1))
+    out: List[int] = []
+    for tok in (s or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        out.append(int(tok))
+    if not out:
+        raise ValueError("--subjects must be non-empty (or use 'all')")
+    return out
 
 
-def _welch_psd(x: np.ndarray, fs: float) -> Tuple[np.ndarray, np.ndarray]:
-    # x: [T]
-    nperseg = min(256, x.shape[0])
-    f, pxx = welch(x, fs=fs, nperseg=nperseg, noverlap=nperseg // 2)
-    return f, pxx
+def _ensure_dir(d: str) -> str:
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
-def _bandpower(f: np.ndarray, pxx: np.ndarray, fmin: float, fmax: float) -> float:
-    m = (f >= fmin) & (f <= fmax)
-    if not np.any(m):
+def _periodogram_psd(x: np.ndarray, fs: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Simple periodogram PSD."""
+    x = np.asarray(x, dtype=np.float64)
+    x = x - float(np.mean(x))
+    n = int(x.shape[0])
+    if n < 8:
+        freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+        return freqs, np.zeros_like(freqs, dtype=np.float64)
+
+    win = np.hanning(n)
+    xw = x * win
+    xf = np.fft.rfft(xw, n=n)
+    psd = (np.abs(xf) ** 2) / (fs * np.sum(win ** 2) + 1e-12)
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+    return freqs, psd
+
+
+def _bandpowers_trial(
+    X_ct: np.ndarray, fs: float, bands: List[Tuple[str, float, float]], eps: float = 1e-12
+) -> Dict[str, float]:
+    C, _ = X_ct.shape
+    band_sums = {name: 0.0 for (name, _, _) in bands}
+
+    for c in range(C):
+        freqs, psd = _periodogram_psd(X_ct[c], fs)
+        if freqs.size < 2:
+            continue
+        df = float(freqs[1] - freqs[0])
+        for name, lo, hi in bands:
+            m = (freqs >= lo) & (freqs < hi)
+            p = float(np.sum(psd[m]) * df)
+            band_sums[name] += np.log10(p + eps)
+
+    for k in band_sums:
+        band_sums[k] /= max(C, 1)
+    return band_sums
+
+
+def _psd_slope_trial(X_ct: np.ndarray, fs: float, f_lo: float = 4.0, f_hi: float = 30.0, eps: float = 1e-12) -> float:
+    C, _ = X_ct.shape
+    psd_sum = None
+    freqs = None
+    for c in range(C):
+        freqs, psd = _periodogram_psd(X_ct[c], fs)
+        psd_sum = psd if psd_sum is None else (psd_sum + psd)
+    if psd_sum is None or freqs is None:
         return float("nan")
-    return float(np.trapz(pxx[m], f[m]))
+    psd_mean = psd_sum / max(C, 1)
+
+    m = (freqs >= f_lo) & (freqs <= f_hi)
+    f = freqs[m]
+    p = psd_mean[m]
+    if f.size < 5:
+        return float("nan")
+    x = np.log10(f + eps)
+    y = np.log10(p + eps)
+    a, _ = np.polyfit(x, y, deg=1)
+    return float(a)
 
 
-def _slope_and_residual_peaks(
-    f: np.ndarray,
-    pxx: np.ndarray,
-    fit_lo: float = 4.0,
-    fit_hi: float = 40.0,
-    peak_bands: Tuple[Tuple[float, float], Tuple[float, float]] = ((8.0, 13.0), (13.0, 30.0)),
-) -> Tuple[float, float, float]:
-    """Return (slope, mu_peak_resid, beta_peak_resid).
-
-    Fit line in log10 space: log10(P) = a + b log10(f).
-    We return b (slope) and maximum positive residual in each band.
-    """
-
-    m = (f >= fit_lo) & (f <= fit_hi)
-    f2 = f[m]
-    p2 = pxx[m]
-    if f2.size < 5:
-        return float("nan"), float("nan"), float("nan")
-
-    # avoid log(0)
-    y = np.log10(p2 + 1e-12)
-    x = np.log10(f2 + 1e-12)
-    A = np.vstack([np.ones_like(x), x]).T
-    coef, *_ = np.linalg.lstsq(A, y, rcond=None)
-    a, b = coef
-    yhat = a + b * x
-    resid = y - yhat
-
-    def max_resid(lo: float, hi: float) -> float:
-        mm = (f2 >= lo) & (f2 <= hi)
-        if not np.any(mm):
-            return float("nan")
-        return float(np.max(resid[mm]))
-
-    mu_r = max_resid(*peak_bands[0])
-    beta_r = max_resid(*peak_bands[1])
-    return float(b), mu_r, beta_r
+def _temporal_grad_energy_trial(X_ct: np.ndarray) -> float:
+    d = np.diff(X_ct, axis=1)
+    return float(np.mean(d * d))
 
 
-def _laplacian_energy(X: np.ndarray, neighbors: List[List[int]]) -> float:
-    """Mean squared laplacian output, averaged over channels and time."""
-    Y = apply_reference(X[None, ...], mode="laplacian", lap_neighbors=neighbors)[0]
-    return float(np.mean(Y**2))
+def _common_mode_ratio_trial(X_ct: np.ndarray, eps: float = 1e-12) -> float:
+    cm = np.mean(X_ct, axis=0, keepdims=False)
+    num = float(np.sum(cm * cm))
+    den = float(np.sum(X_ct * X_ct)) + eps
+    return num / den
 
 
-def _bipolar_energy(X: np.ndarray, neighbors: List[List[int]]) -> float:
-    Y = apply_reference(X[None, ...], mode="bipolar", lap_neighbors=neighbors)[0]
-    return float(np.mean(Y**2))
+def _mean_abs_corr_trial(X_ct: np.ndarray, eps: float = 1e-12) -> float:
+    X = X_ct.astype(np.float64, copy=False)
+    X = X - X.mean(axis=1, keepdims=True)
+    denom = np.sqrt(np.sum(X * X, axis=1, keepdims=True)) + eps
+    Xn = X / denom
+    corr = Xn @ Xn.T
+    C = corr.shape[0]
+    if C <= 1:
+        return 0.0
+    mask = ~np.eye(C, dtype=bool)
+    return float(np.mean(np.abs(corr[mask])))
 
 
-@dataclass
-class TrialFeatures:
-    slope: float
-    mu_peak_resid: float
-    beta_peak_resid: float
-    mu_power: float
-    beta_power: float
-    laplacian_energy: float
-    bipolar_energy: float
+def _extract_features(
+    X: np.ndarray,
+    y: np.ndarray,
+    fs: float,
+    bands: List[Tuple[str, float, float]],
+    max_trials: int | None = None,
+    seed: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    N = int(X.shape[0])
+    idx = np.arange(N)
+    if max_trials is not None and N > int(max_trials):
+        rng = np.random.default_rng(int(seed))
+        idx = rng.choice(idx, size=int(max_trials), replace=False)
+        idx = np.sort(idx)
+
+    Xs = X[idx]
+    ys = y[idx]
+
+    names: List[str] = []
+    for name, _, _ in bands:
+        names.append(f"log10_bandpower_{name}")
+    names += [
+        "psd_slope_4_30",
+        "temporal_grad_energy",
+        "common_mode_ratio",
+        "mean_abs_corr",
+    ]
+
+    F = len(names)
+    feats = np.zeros((Xs.shape[0], F), dtype=np.float32)
+
+    for i in range(Xs.shape[0]):
+        trial = Xs[i]
+        bp = _bandpowers_trial(trial, fs, bands)
+        col = 0
+        for name, _, _ in bands:
+            feats[i, col] = float(bp[name])
+            col += 1
+        feats[i, col] = float(_psd_slope_trial(trial, fs)); col += 1
+        feats[i, col] = float(_temporal_grad_energy_trial(trial)); col += 1
+        feats[i, col] = float(_common_mode_ratio_trial(trial)); col += 1
+        feats[i, col] = float(_mean_abs_corr_trial(trial)); col += 1
+
+    return feats, ys, names
 
 
-def _standardized_mean_shift(a: np.ndarray, b: np.ndarray) -> float:
-    """|| (mu_a - mu_b) / pooled_std ||_2 over feature dimensions."""
-    mu_a = np.nanmean(a, axis=0)
-    mu_b = np.nanmean(b, axis=0)
-    sd_a = np.nanstd(a, axis=0)
-    sd_b = np.nanstd(b, axis=0)
-    pooled = np.sqrt(0.5 * (sd_a**2 + sd_b**2)) + 1e-12
-    z = (mu_a - mu_b) / pooled
-    return float(np.linalg.norm(z))
+def _apply_standardize(mode: str, X: np.ndarray, mu_sd: Tuple[np.ndarray, np.ndarray] | None, instance_robust: bool) -> np.ndarray:
+    mode = (mode or "none").lower()
+    if mode == "none":
+        return X.astype(np.float32, copy=False)
+    if mode == "train":
+        if mu_sd is None:
+            raise ValueError("standardize_mode=train but mu/sd is None")
+        return apply_standardizer(X, *mu_sd).astype(np.float32, copy=False)
+    if mode == "instance":
+        return standardize_instance(X, robust=bool(instance_robust)).astype(np.float32, copy=False)
+    if mode == "robust_instance":
+        return standardize_instance(X, robust=True).astype(np.float32, copy=False)
+    raise ValueError(f"Unknown standardize_mode: {mode}")
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data_root", type=str, required=True)
-    ap.add_argument("--subject", type=int, default=1)
-    ap.add_argument(
-        "--ref_modes",
-        type=str,
-        default="native,car,laplacian,bipolar,gs,median",
-        help="Comma-separated list.",
-    )
-    ap.add_argument(
-        "--standardize_mode",
-        type=str,
-        default="none",
-        choices=["none", "instance", "train"],
-        help="Use 'none' or 'instance' to keep this audit about referencing, not train-fit stats.",
-    )
-    ap.add_argument("--keep_channels", type=str, default=None)
-    ap.add_argument("--ref_channel", type=str, default="Cz")
-    ap.add_argument(
-        "--channels",
-        type=str,
-        default="FC3,FC4,C3,Cz,C4,CP3,CP4",
-        help="Channels to compute PSD features on (comma-separated). Must exist after keep_channels.",
-    )
-    ap.add_argument("--split", type=str, default="test", choices=["train", "test", "both"])
-    ap.add_argument("--max_trials", type=int, default=0, help="0 = no limit")
-    ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--out_dir", type=str, required=True)
-    args = ap.parse_args()
+    p = argparse.ArgumentParser("Feature shift audit for reference transforms")
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    p.add_argument("--data_root", type=str, required=True)
+    p.add_argument("--subjects", type=str, default="1", help="Comma-separated subject ids or 'all'")
+    p.add_argument("--n_sub", type=int, default=9)
 
-    modes = _parse_modes(args.ref_modes)
+    p.add_argument("--split", type=str, default="test", choices=["train", "test"])
+    p.add_argument("--ref_modes", type=str, required=True, help="Comma-separated modes to evaluate")
+    p.add_argument("--keep_channels", type=str, default="", help="Preset name or comma-separated channel names")
+    p.add_argument("--ref_channel", type=str, default="Cz")
+
+    p.add_argument("--standardize_mode", type=str, default="none", choices=["none", "train", "instance", "robust_instance"])
+    p.add_argument("--standardize_fit_mode", type=str, default="native", help="Ref mode used to fit mu/sd when standardize_mode=train")
+    p.add_argument("--max_trials", type=int, default=None)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--instance_robust", action="store_true")
+
+    p.add_argument("--out_dir", type=str, required=True)
+
+    args = p.parse_args()
+
+    out_dir = _ensure_dir(args.out_dir)
+
+    subjects = _parse_subjects(args.subjects, args.n_sub)
+    ref_modes = _parse_list(args.ref_modes)
+    if not ref_modes:
+        raise ValueError("--ref_modes must be non-empty")
+
     keep_idx = parse_keep_channels(args.keep_channels, all_names=BCI2A_CH_NAMES)
-    if keep_idx is None:
-        keep_names = list(BCI2A_CH_NAMES)
-    else:
-        keep_names = [BCI2A_CH_NAMES[i] for i in keep_idx]
+    keep_names = [BCI2A_CH_NAMES[i] for i in keep_idx] if keep_idx is not None else list(BCI2A_CH_NAMES)
 
-    # neighbor lists in kept montage
-    lap_nb = neighbors_to_index_list(all_names=BCI2A_CH_NAMES, keep_names=keep_names, sort_by_distance=False)
-    bip_nb = neighbors_to_index_list(all_names=BCI2A_CH_NAMES, keep_names=keep_names, sort_by_distance=True)
+    lap_neighbors = neighbors_to_index_list(
+        all_names=BCI2A_CH_NAMES,
+        keep_names=keep_names,
+        sort_by_distance=False,
+    )
+    ref_map = name_to_index(keep_names)
+    ref_idx = ref_map.get(args.ref_channel, None)
 
-    # channel indices for PSD metrics
-    ch_list = _parse_list(args.channels) or []
-    ch_idx: List[int] = []
-    for nm in ch_list:
-        try:
-            ch_idx.append(name_to_index(nm, keep_names))
-        except Exception as e:
-            raise ValueError(f"Channel '{nm}' not found in kept montage. keep_channels={args.keep_channels}") from e
+    bands = [
+        ("delta", 1.0, 4.0),
+        ("theta", 4.0, 8.0),
+        ("alpha", 8.0, 13.0),
+        ("beta", 13.0, 30.0),
+    ]
 
-    # Load *native, unstandardized* once so every mode starts from identical trials.
-    # We then apply reference + (optional) standardization ourselves in a controlled way.
-    (Xtr0, _ytr0), (Xte0, _yte0) = load_subject_dependent(
-    args.data_root,
-    args.subject,
-    ea=False,
-    standardize=False,
-    ref_mode="native",
-    keep_channels=args.keep_channels,
-    ref_channel=args.ref_channel,
-    laplacian=True,
-)
+    summary_rows: List[Dict[str, object]] = []
+    feature_names: List[str] | None = None
 
-    # Optional subsampling indices are chosen once and reused across modes.
-    if args.split == "train":
-        base_train = Xtr0
-        base_test = None
-    elif args.split == "test":
-        base_train = Xtr0
-        base_test = Xte0
-    else:
-        base_train = Xtr0
-        base_test = Xte0
-
-    sel_train = None
-    sel_test = None
-    if args.max_trials:
-        rng = np.random.default_rng(args.seed)
-        if base_train is not None and base_train.shape[0] > args.max_trials:
-            sel_train = rng.choice(base_train.shape[0], size=args.max_trials, replace=False)
-        if base_test is not None and base_test.shape[0] > args.max_trials:
-            sel_test = rng.choice(base_test.shape[0], size=args.max_trials, replace=False)
-
-    # dataset sampling rate in this repo is fixed for IV-2a
-    fs = 250.0
-
-    results: Dict[str, Dict[str, float]] = {}
-    per_mode_rows: Dict[str, List[List[float]]] = {}
-
-    def _std_instance(X: np.ndarray) -> np.ndarray:
-        mu = np.mean(X, axis=-1, keepdims=True)
-        sd = np.std(X, axis=-1, keepdims=True) + 1e-12
-        return (X - mu) / sd
-
-    def _std_trainfit(Xtr: np.ndarray, Xte: Optional[np.ndarray]) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        # Fit per-channel mean/std over (trials,time)
-        mu = np.mean(Xtr, axis=(0, 2), keepdims=True)
-        sd = np.std(Xtr, axis=(0, 2), keepdims=True) + 1e-12
-        Xtr2 = (Xtr - mu) / sd
-        Xte2 = None if Xte is None else (Xte - mu) / sd
-        return Xtr2, Xte2
-
-    for mode in modes:
-        # Apply reference transform to identical underlying trials.
-        Xtr_m = apply_reference(base_train, mode=mode, lap_neighbors=lap_nb)
-        Xte_m = None if base_test is None else apply_reference(base_test, mode=mode, lap_neighbors=lap_nb)
-
-        if args.standardize_mode == "instance":
-            Xtr_m = _std_instance(Xtr_m)
-            if Xte_m is not None:
-                Xte_m = _std_instance(Xte_m)
-        elif args.standardize_mode == "train":
-            Xtr_m, Xte_m = _std_trainfit(Xtr_m, Xte_m)
-
-        if args.split == "train":
-            X = Xtr_m
-            if sel_train is not None:
-                X = X[sel_train]
-        elif args.split == "test":
-            if Xte_m is None:
-                raise RuntimeError("internal: Xte_m is None")
-            X = Xte_m
-            if sel_test is not None:
-                X = X[sel_test]
-        else:
-            if Xte_m is None:
-                raise RuntimeError("internal: Xte_m is None")
-            Xtr_s = Xtr_m if sel_train is None else Xtr_m[sel_train]
-            Xte_s = Xte_m if sel_test is None else Xte_m[sel_test]
-            X = np.concatenate([Xtr_s, Xte_s], axis=0)
-
-        rows: List[List[float]] = []
-        for n in range(X.shape[0]):
-            Xi = X[n]  # [C,T]
-
-            # PSD metrics: average across selected channels
-            slopes = []
-            mu_peaks = []
-            beta_peaks = []
-            mu_pows = []
-            beta_pows = []
-
-            for ci in ch_idx:
-                f, pxx = _welch_psd(Xi[ci], fs)
-                slope, mu_r, beta_r = _slope_and_residual_peaks(f, pxx)
-                slopes.append(slope)
-                mu_peaks.append(mu_r)
-                beta_peaks.append(beta_r)
-                mu_pows.append(_bandpower(f, pxx, 8.0, 13.0))
-                beta_pows.append(_bandpower(f, pxx, 13.0, 30.0))
-
-            slope = float(np.nanmean(slopes))
-            mu_peak = float(np.nanmean(mu_peaks))
-            beta_peak = float(np.nanmean(beta_peaks))
-            mu_pow = float(np.nanmean(mu_pows))
-            beta_pow = float(np.nanmean(beta_pows))
-
-            lap_e = _laplacian_energy(Xi, lap_nb)
-            bip_e = _bipolar_energy(Xi, bip_nb)
-
-            tf = TrialFeatures(
-                slope=slope,
-                mu_peak_resid=mu_peak,
-                beta_peak_resid=beta_peak,
-                mu_power=mu_pow,
-                beta_power=beta_pow,
-                laplacian_energy=lap_e,
-                bipolar_energy=bip_e,
-            )
-            rows.append(list(asdict(tf).values()))
-
-        feats = np.asarray(rows, dtype=np.float64)
-        per_mode_rows[mode] = rows
-
-        # summary
-        summary = {}
-        keys = list(asdict(TrialFeatures(0, 0, 0, 0, 0, 0, 0)).keys())
-        for k_i, k in enumerate(keys):
-            summary[f"{k}_mean"] = float(np.nanmean(feats[:, k_i]))
-            summary[f"{k}_std"] = float(np.nanstd(feats[:, k_i]))
-        results[mode] = summary
-
-        # Save per-mode feature arrays for deeper analysis later.
-        np.save(os.path.join(args.out_dir, f"features_{mode}.npy"), feats)
-
-    # Pairwise shift distances
-    keys = list(per_mode_rows.keys())
-    shift = {a: {} for a in keys}
-    for a in keys:
-        A = np.asarray(per_mode_rows[a], dtype=np.float64)
-        for b in keys:
-            B = np.asarray(per_mode_rows[b], dtype=np.float64)
-            shift[a][b] = _standardized_mean_shift(A, B)
-
-    with open(os.path.join(args.out_dir, "summary.json"), "w") as f:
-        json.dump(
-            {
-                "keep_channels": keep_names,
-                "channels_for_psd": ch_list,
-                "ref_modes": keys,
-                "split": args.split,
-                "summary": results,
-                "pairwise_standardized_mean_shift": shift,
-            },
-            f,
-            indent=2,
+    for sub in subjects:
+        X_raw, y = load_bci2a_session(
+            args.data_root,
+            int(sub),
+            training=(args.split == "train"),
+            ref_mode="native",
+            keep_channels=args.keep_channels,
+            ref_channel=args.ref_channel,
+            laplacian=False,
         )
 
-    # Also write a compact CSV
-    csv_path = os.path.join(args.out_dir, "summary.csv")
-    headers = ["mode"] + sorted(next(iter(results.values())).keys())
-    with open(csv_path, "w", newline="") as f:
-        wcsv = csv.writer(f)
-        wcsv.writerow(headers)
-        for mode in keys:
-            wcsv.writerow([mode] + [results[mode][h] for h in headers[1:]])
+        mu_sd = None
+        if (args.standardize_mode or "none").lower() == "train":
+            fit_mode = (args.standardize_fit_mode or "native").strip()
+            X_fit = apply_reference(X_raw, mode=fit_mode, ref_idx=ref_idx, lap_neighbors=lap_neighbors)
+            mu_sd = fit_standardizer(X_fit)
 
-    print(f"Wrote: {os.path.join(args.out_dir, 'summary.json')}")
-    print(f"Wrote: {csv_path}")
+        for m in ref_modes:
+            X_m = apply_reference(X_raw, mode=m, ref_idx=ref_idx, lap_neighbors=lap_neighbors)
+            X_m = _apply_standardize(args.standardize_mode, X_m, mu_sd, args.instance_robust)
+
+            feats, ys, names = _extract_features(
+                X_m,
+                y,
+                fs=float(BCI2A_FS),
+                bands=bands,
+                max_trials=args.max_trials,
+                seed=args.seed,
+            )
+            if feature_names is None:
+                feature_names = names
+
+            npz_path = os.path.join(out_dir, f"per_trial_features_sub{sub:02d}_mode_{m}.npz")
+            np.savez_compressed(
+                npz_path,
+                features=feats,
+                labels=ys,
+                feature_names=np.array(names, dtype=object),
+            )
+
+            means = np.nanmean(feats, axis=0)
+            stds = np.nanstd(feats, axis=0)
+
+            row = {
+                "subject": int(sub),
+                "split": str(args.split),
+                "mode": str(m),
+                "n_trials": int(feats.shape[0]),
+            }
+            for j, name in enumerate(names):
+                row[f"{name}__mean"] = float(means[j])
+                row[f"{name}__std"] = float(stds[j])
+            summary_rows.append(row)
+
+    if not summary_rows:
+        raise RuntimeError("No outputs produced. Check --subjects and --data_root.")
+
+    fieldnames = list(summary_rows[0].keys())
+    csv_path = os.path.join(out_dir, "summary.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in summary_rows:
+            w.writerow(r)
+
+    meta = {
+        "args": vars(args),
+        "subjects": subjects,
+        "ref_modes": ref_modes,
+        "keep_channels": args.keep_channels,
+        "channels": keep_names,
+        "feature_names": feature_names,
+        "fs": float(BCI2A_FS),
+    }
+    with open(os.path.join(out_dir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print(f"[feature_shift_audit] wrote: {csv_path}")
+    print(f"[feature_shift_audit] wrote per-trial npz for {len(subjects) * len(ref_modes)} subject-mode combos")
+    print(f"[feature_shift_audit] wrote: {os.path.join(out_dir, 'meta.json')}")
 
 
 if __name__ == "__main__":
