@@ -1,4 +1,5 @@
 import numpy as np
+from collections import deque
 
 # These reference transforms are designed to be model-agnostic and dataset-agnostic
 # within the constraints of multi-channel EEG. They operate on either:
@@ -210,6 +211,42 @@ def apply_bipolar_edges(
         return Y
     raise ValueError(f"apply_bipolar_edges expects 2D or 3D array, got {Xf.ndim}D")
 
+def make_bipolar_parent_neighbors(neighbors_lists: list[list[int]], root_idx: int) -> list[list[int]]:
+    """
+    Build a deterministic spanning-tree parent map from an undirected neighbor graph.
+    Returns neighbors such that each i subtracts parent[i], and root subtracts itself.
+
+    This guarantees exactly one directed cycle (root self-loop), so bipolar has null_dim = 1
+    if the underlying graph is connected.
+    """
+    C = len(neighbors_lists)
+
+    # undirected adjacency
+    adj = [set() for _ in range(C)]
+    for i, ns in enumerate(neighbors_lists):
+        for j in ns:
+            j = int(j)
+            if i == j:
+                continue
+            adj[i].add(j)
+            adj[j].add(i)
+
+    parent = [None] * C
+    parent[root_idx] = root_idx
+
+    q = deque([root_idx])
+    while q:
+        u = q.popleft()
+        for v in sorted(adj[u]):  # deterministic
+            if parent[v] is None:
+                parent[v] = u
+                q.append(v)
+
+    if any(p is None for p in parent):
+        bad = [i for i, p in enumerate(parent) if p is None]
+        raise RuntimeError(f"Neighbor graph disconnected, unreachable nodes: {bad}")
+
+    return [[int(parent[i])] for i in range(C)]
 
 def apply_random_global_reference(
     X: np.ndarray,
@@ -276,10 +313,17 @@ def apply_reference(
         if lap_neighbors is None:
             raise ValueError("lap_neighbors is required for mode='laplacian'")
         return apply_laplacian(X, lap_neighbors)
+    # if m in ("bipolar", "bip", "bipolar_like"):
+    #     if lap_neighbors is None:
+    #         raise ValueError("lap_neighbors is required for mode='bipolar'")
+    #     return apply_bipolar(X, lap_neighbors)
     if m in ("bipolar", "bip", "bipolar_like"):
         if lap_neighbors is None:
             raise ValueError("lap_neighbors is required for mode='bipolar'")
-        return apply_bipolar(X, lap_neighbors)
+        if ref_idx is None:
+            raise ValueError("ref_idx is required for mode='bipolar' (root channel)")
+        bip_neighbors = make_bipolar_parent_neighbors(lap_neighbors, root_idx=int(ref_idx))
+        return apply_bipolar(X, bip_neighbors)
     if m in ("bipolar_edges", "bip_edges", "edges_bipolar"):
         if lap_neighbors is None:
             raise ValueError("lap_neighbors is required for mode='bipolar_edges'")
