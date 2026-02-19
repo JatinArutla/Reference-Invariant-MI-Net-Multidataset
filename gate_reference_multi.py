@@ -89,6 +89,23 @@ def build_model(args) -> tf.keras.Model:
     )
 
 
+def maybe_load_ssl_weights(model: tf.keras.Model, *, ssl_weights: str | None, subject: int):
+    if not ssl_weights:
+        return
+    w = ssl_weights
+    if "{sub" in w or "{sub:" in w:
+        w = w.format(sub=subject)
+    if os.path.isdir(w):
+        # Common convention: directory contains weights.h5
+        cand = os.path.join(w, "weights.h5")
+        if os.path.exists(cand):
+            w = cand
+    if not os.path.exists(w):
+        raise FileNotFoundError(f"ssl_weights not found: {w}")
+    # by_name + skip_mismatch so we can load encoder layers even if heads differ.
+    model.load_weights(w, by_name=True, skip_mismatch=True)
+
+
 def _binary_label_frac(X: np.ndarray, y: np.ndarray, frac: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
     if frac >= 0.999:
         return X, y
@@ -207,6 +224,7 @@ def run_one_subject(args, subject: int) -> Dict:
         raise ValueError(f"Unknown train_strategy {args.train_strategy}")
 
     model = build_model(args)
+    maybe_load_ssl_weights(model, ssl_weights=args.ssl_weights, subject=subject)
     model.compile(
         optimizer=Adam(learning_rate=args.lr),
         loss=CategoricalCrossentropy(from_logits=args.from_logits),
@@ -272,8 +290,23 @@ def run_one_subject(args, subject: int) -> Dict:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", required=True, choices=["iv2a", "lee2019", "physionet"])
-    ap.add_argument("--data_root", default="", help="Required for iv2a only")
+    ap.add_argument(
+        "--dataset",
+        required=True,
+        choices=["iv2a", "openbmi_local", "physionet_local", "lee2019", "physionet"],
+        help=(
+            "Dataset id. Prefer *_local when you already have files on disk (Kaggle). "
+            "MOABB-based ids (lee2019, physionet) may download/cached via the internet."
+        ),
+    )
+    ap.add_argument(
+        "--data_root",
+        default="",
+        help=(
+            "Dataset root on disk. Required for iv2a, openbmi_local, physionet_local. "
+            "For MOABB datasets, this can be empty if using cache_root."
+        ),
+    )
     ap.add_argument("--cache_root", default="", help="Optional MOABB cache root")
     ap.add_argument("--out_dir", default="outputs_multi")
     ap.add_argument("--subject", type=int, default=1)
@@ -305,6 +338,15 @@ def main():
     ap.add_argument("--early_stop", action="store_true")
     ap.add_argument("--patience", type=int, default=20)
     ap.add_argument("--verbose", type=int, default=1)
+
+    ap.add_argument(
+        "--ssl_weights",
+        default=None,
+        help=(
+            "Optional SSL init weights. Either a file path or a template containing '{sub:02d}'. "
+            "Loaded with by_name=True, skip_mismatch=True."
+        ),
+    )
 
     # ATCNet params (kept consistent with existing repo)
     ap.add_argument("--n_classes", type=int, default=2)
