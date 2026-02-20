@@ -423,7 +423,7 @@ def main():
     ap.add_argument("--tcn_filters", type=int, default=32)
     ap.add_argument("--tcn_dropout", type=float, default=0.3)
     ap.add_argument("--tcn_activation", default="elu")
-    ap.add_argument("--fuse", default="avg")
+    ap.add_argument("--fuse", type=str, default="average", choices=["average", "concat"])
     ap.add_argument("--from_logits", action="store_true")
     args = ap.parse_args()
 
