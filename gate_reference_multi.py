@@ -211,8 +211,23 @@ def run_one_subject(args, subject: int) -> Dict:
             mu, sd = None, None
         else:
             raise ValueError("standardize_mode must be one of: train, instance, none")
-        seq_tr = ArraySequence(_reshape_for_model(X_tr_ref), to_categorical(y_tr, 2), batch_size=args.batch)
-        seq_va = ArraySequence(_reshape_for_model(X_va_ref), to_categorical(y_va, 2), batch_size=args.batch, shuffle=False)
+        # ArraySequence expects explicit shuffle + seed.
+        # Derive a subject-specific seed so different subjects don't share identical shuffles.
+        seq_seed = int(args.seed) + int(subject) * 1000
+        seq_tr = ArraySequence(
+            _reshape_for_model(X_tr_ref),
+            to_categorical(y_tr, 2),
+            batch_size=args.batch,
+            shuffle=True,
+            seed=seq_seed,
+        )
+        seq_va = ArraySequence(
+            _reshape_for_model(X_va_ref),
+            to_categorical(y_va, 2),
+            batch_size=args.batch,
+            shuffle=False,
+            seed=seq_seed,
+        )
     elif args.train_strategy in ("jitter", "concat"):
         # For train-mode standardization, fit mu/sd on a single deterministic reference (native)
         # and keep it fixed. This avoids leaking held-out families into statistics.
@@ -241,7 +256,14 @@ def run_one_subject(args, subject: int) -> Dict:
             X_va_nat = apply_standardizer(X_va_nat, mu, sd)
         elif args.standardize_mode == "instance":
             X_va_nat = standardize_instance(X_va_nat, robust=args.instance_robust)
-        seq_va = ArraySequence(_reshape_for_model(X_va_nat), to_categorical(y_va, 2), batch_size=args.batch, shuffle=False)
+        seq_seed = int(args.seed) + int(subject) * 1000
+        seq_va = ArraySequence(
+            _reshape_for_model(X_va_nat),
+            to_categorical(y_va, 2),
+            batch_size=args.batch,
+            shuffle=False,
+            seed=seq_seed,
+        )
     else:
         raise ValueError(f"Unknown train_strategy {args.train_strategy}")
 
