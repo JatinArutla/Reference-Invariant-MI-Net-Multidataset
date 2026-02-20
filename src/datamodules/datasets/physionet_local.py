@@ -115,7 +115,10 @@ class PhysionetLocal(BaseLRDataset):
         resample_hz: Optional[float],
         band: Optional[Tuple[float, float]],
         cache_root: Optional[str] = None,
+        task: str = "lr",
     ):
+        if task != "lr":
+            raise ValueError("Physionet local loader in this repo supports only --task lr (binary left-vs-right).")
         X_all, y_all, meta = _load_physionet_subject_left_right(self.data_root, subject, tmin=tmin, tmax=tmax)
         sfreq = float(meta.get("sfreq", 160.0))
 

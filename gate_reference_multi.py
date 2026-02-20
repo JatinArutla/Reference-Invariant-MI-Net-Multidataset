@@ -7,7 +7,10 @@ Key differences:
   - Enforces a fixed cross-dataset input contract (CANON18, 0-3s, 8-32Hz, 160Hz)
   - Supports leave-one-reference-family-out training and evaluation
 
-The task is always binary: left vs right.
+Default task is binary: left vs right.
+
+This script prints table-style summaries (like the single-dataset repo) while
+still writing per-subject JSON results under out_dir.
 """
 
 import os
@@ -67,6 +70,10 @@ def _reshape_for_model(X: np.ndarray) -> np.ndarray:
 
 
 def build_model(args) -> tf.keras.Model:
+    # Backward/typo tolerance: some old commands used "avg".
+    fuse = args.fuse
+    if fuse == "avg":
+        fuse = "average"
     return build_atcnet(
         n_classes=args.n_classes,
         in_chans=args.n_channels,
@@ -83,7 +90,7 @@ def build_model(args) -> tf.keras.Model:
         tcn_filters=args.tcn_filters,
         tcn_dropout=args.tcn_dropout,
         tcn_activation=args.tcn_activation,
-        fuse=args.fuse,
+        fuse=fuse,
         from_logits=args.from_logits,
         return_ssl_feat=False,
     )
@@ -106,12 +113,26 @@ def maybe_load_ssl_weights(model: tf.keras.Model, *, ssl_weights: str | None, su
     model.load_weights(w, by_name=True, skip_mismatch=True)
 
 
-def _binary_label_frac(X: np.ndarray, y: np.ndarray, frac: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+def _label_frac(X: np.ndarray, y: np.ndarray, frac: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
     if frac >= 0.999:
         return X, y
     sss = StratifiedShuffleSplit(n_splits=1, train_size=frac, random_state=seed)
     idx, _ = next(sss.split(X, y))
     return X[idx], y[idx]
+
+
+def _pretty_table_row(label: str, values: list[float]) -> str:
+    parts = [f"{v:>10.2f}" for v in values]
+    return f"{label:<10s} " + " ".join(parts)
+
+
+def print_avg_table(title: str, modes: list[str], row_name: str, accs: list[float]):
+    print("\n" + title)
+    header = "train\\test".ljust(10) + " " + " ".join([f"{m:>10s}" for m in modes])
+    print("\nAveraged accuracy (%):")
+    print(header)
+    print("-" * len(header))
+    print(_pretty_table_row(row_name, [a * 100.0 for a in accs]))
 
 
 def _compute_lap_neighbors() -> list[list[int]]:
@@ -152,10 +173,11 @@ def run_one_subject(args, subject: int) -> Dict:
         resample_hz=args.resample_hz,
         band=(args.band_lo, args.band_hi),
         cache_root=args.cache_root,
+        task=args.task,
     )
 
     # Low-label
-    X_tr0, y_tr0 = _binary_label_frac(X_tr0, y_tr0, args.label_frac, seed=args.seed)
+    X_tr0, y_tr0 = _label_frac(X_tr0, y_tr0, args.label_frac, seed=args.seed)
 
     # Train/val split within train.
     sss = StratifiedShuffleSplit(n_splits=1, test_size=args.val_frac, random_state=args.seed)
@@ -216,14 +238,14 @@ def run_one_subject(args, subject: int) -> Dict:
         seq_seed = int(args.seed) + int(subject) * 1000
         seq_tr = ArraySequence(
             _reshape_for_model(X_tr_ref),
-            to_categorical(y_tr, 2),
+            to_categorical(y_tr, args.n_classes),
             batch_size=args.batch,
             shuffle=True,
             seed=seq_seed,
         )
         seq_va = ArraySequence(
             _reshape_for_model(X_va_ref),
-            to_categorical(y_va, 2),
+            to_categorical(y_va, args.n_classes),
             batch_size=args.batch,
             shuffle=False,
             seed=seq_seed,
@@ -259,7 +281,7 @@ def run_one_subject(args, subject: int) -> Dict:
         seq_seed = int(args.seed) + int(subject) * 1000
         seq_va = ArraySequence(
             _reshape_for_model(X_va_nat),
-            to_categorical(y_va, 2),
+            to_categorical(y_va, args.n_classes),
             batch_size=args.batch,
             shuffle=False,
             seed=seq_seed,
@@ -299,15 +321,29 @@ def run_one_subject(args, subject: int) -> Dict:
         model.load_weights(ckpt_path)
 
     # Evaluate across eval modes
+    # Basic dataset stats (helps catch "chance" runs due to broken labels/splits)
+    def _class_counts(y: np.ndarray) -> dict:
+        u, c = np.unique(y, return_counts=True)
+        return {int(uu): int(cc) for uu, cc in zip(u, c)}
+
     results = {
         "dataset": args.dataset,
         "subject": int(subject),
+        "task": args.task,
         "train_strategy": args.train_strategy,
         "train_mode": args.train_mode,
         "train_modes": train_modes,
         "eval_modes": eval_modes,
         "label_frac": float(args.label_frac),
         "holdout_family": args.holdout_family,
+        "data": {
+            "n_train": int(len(y_tr)),
+            "n_val": int(len(y_va)),
+            "n_test": int(len(y_te0)),
+            "class_counts_train": _class_counts(y_tr),
+            "class_counts_val": _class_counts(y_va),
+            "class_counts_test": _class_counts(y_te0),
+        },
         "metrics": {},
     }
 
@@ -371,6 +407,17 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--label_frac", type=float, default=1.0)
 
+    # Task
+    ap.add_argument(
+        "--task",
+        default="lr",
+        choices=["lr", "4class"],
+        help=(
+            "Task definition. 'lr' is binary left-vs-right (default, works for all datasets). "
+            "'4class' is only supported for iv2a in this repo."
+        ),
+    )
+
     # Preprocessing contract
     ap.add_argument("--tmin", type=float, default=0.0)
     ap.add_argument("--tmax", type=float, default=3.0)
@@ -397,6 +444,7 @@ def main():
     ap.add_argument("--early_stop", action="store_true")
     ap.add_argument("--patience", type=int, default=20)
     ap.add_argument("--verbose", type=int, default=1)
+    ap.add_argument("--print_json", action="store_true", help="Print full per-subject JSON blobs")
 
     ap.add_argument(
         "--ssl_weights",
@@ -423,11 +471,21 @@ def main():
     ap.add_argument("--tcn_filters", type=int, default=32)
     ap.add_argument("--tcn_dropout", type=float, default=0.3)
     ap.add_argument("--tcn_activation", default="elu")
-    ap.add_argument("--fuse", type=str, default="average", choices=["average", "concat"])
+    ap.add_argument("--fuse", default="average", choices=["average", "concat", "avg"])
     ap.add_argument("--from_logits", action="store_true")
     args = ap.parse_args()
 
     set_seed(args.seed)
+
+    # Enforce task constraints / n_classes.
+    if args.task == "lr":
+        args.n_classes = 2
+    elif args.task == "4class":
+        if args.dataset != "iv2a":
+            raise ValueError("--task 4class is only supported for --dataset iv2a in this repo")
+        args.n_classes = 4
+    else:
+        raise ValueError(args.task)
 
     # Sanity: match in_samples to (tmax-tmin)*resample_hz
     expected = int(round((args.tmax - args.tmin) * args.resample_hz))
@@ -444,14 +502,34 @@ def main():
     for sub in subs:
         r = run_one_subject(args, sub)
         all_res.append(r)
-        print(json.dumps(r, indent=2))
+        if args.print_json:
+            print(json.dumps(r, indent=2))
+        else:
+            acc0 = r["metrics"].get("native", {}).get("acc", None)
+            if acc0 is None:
+                acc0 = list(r["metrics"].values())[0]["acc"]
+            print(f"done: dataset={args.dataset} task={args.task} subject={sub} train={args.train_strategy}:{args.train_mode} native_acc={acc0*100.0:.2f}%")
 
-    # Lightweight aggregate (mean acc per eval mode across subjects)
-    if len(all_res) > 1:
-        agg = {"dataset": args.dataset, "subjects": subs, "mean_acc": {}}
-        modes = all_res[0]["metrics"].keys()
-        for m in modes:
-            agg["mean_acc"][m] = float(np.mean([x["metrics"][m]["acc"] for x in all_res]))
+    # Aggregate + table print (mean acc per eval mode across subjects)
+    if len(all_res) >= 1:
+        modes = list(all_res[0]["metrics"].keys())
+        mean_acc = [float(np.mean([x["metrics"][m]["acc"] for x in all_res])) for m in modes]
+        row = args.train_strategy if args.train_strategy != "fixed" else args.train_mode
+        title = f"Dataset={args.dataset} | task={args.task} | subjects={len(all_res)} | train={args.train_strategy}"
+        print_avg_table(title, modes, row, mean_acc)
+
+        agg = {
+            "dataset": args.dataset,
+            "task": args.task,
+            "subjects": subs,
+            "train_strategy": args.train_strategy,
+            "train_mode": args.train_mode,
+            "train_modes": all_res[0].get("train_modes", []),
+            "eval_modes": modes,
+            "label_frac": float(args.label_frac),
+            "holdout_family": args.holdout_family,
+            "mean_acc": {m: a for m, a in zip(modes, mean_acc)},
+        }
         out_dir = os.path.join(args.out_dir, args.dataset)
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, "aggregate_mean_acc.json"), "w") as f:
