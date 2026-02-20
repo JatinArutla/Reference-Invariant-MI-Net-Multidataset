@@ -44,7 +44,7 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.utils import to_categorical
 
 from src.models.model import build_atcnet
-from src.datamodules.transforms import fit_standardizer, apply_standardizer, apply_reference
+from src.datamodules.transforms import fit_standardizer, apply_standardizer, apply_reference, standardize_instance
 from src.datamodules.channels import CANON_CHS_18, BCI2A_CH_NAMES, neighbors_to_index_list, name_to_index
 from src.datamodules.ref_jitter import RefJitterSequence
 from src.datamodules.array_sequence import ArraySequence
@@ -188,7 +188,10 @@ def run_one_subject(args, subject: int) -> Dict:
             sort_by_distance=True,
         )
 
-    # Standardization is fit on training split only, after applying the *train* reference.
+    # Standardization is applied AFTER reference transform.
+    # - train   : global z-score using mu/sd fit on training split (leakage-safe)
+    # - instance: per-trial, per-channel z-score over time (optionally robust)
+    # - none    : no standardization
     def apply_mode(X, mode: str):
         return apply_reference(X, mode=mode, ref_idx=ref_idx, lap_neighbors=lap_neighbors)
 
@@ -196,29 +199,48 @@ def run_one_subject(args, subject: int) -> Dict:
     if args.train_strategy == "fixed":
         X_tr_ref = apply_mode(X_tr, args.train_mode)
         X_va_ref = apply_mode(X_va, args.train_mode)
-        mu, sd = fit_standardizer(X_tr_ref)
-        X_tr_ref = apply_standardizer(X_tr_ref, mu, sd)
-        X_va_ref = apply_standardizer(X_va_ref, mu, sd)
+        if args.standardize_mode == "train":
+            mu, sd = fit_standardizer(X_tr_ref)
+            X_tr_ref = apply_standardizer(X_tr_ref, mu, sd)
+            X_va_ref = apply_standardizer(X_va_ref, mu, sd)
+        elif args.standardize_mode == "instance":
+            X_tr_ref = standardize_instance(X_tr_ref, robust=args.instance_robust)
+            X_va_ref = standardize_instance(X_va_ref, robust=args.instance_robust)
+            mu, sd = None, None
+        elif args.standardize_mode == "none":
+            mu, sd = None, None
+        else:
+            raise ValueError("standardize_mode must be one of: train, instance, none")
         seq_tr = ArraySequence(_reshape_for_model(X_tr_ref), to_categorical(y_tr, 2), batch_size=args.batch)
         seq_va = ArraySequence(_reshape_for_model(X_va_ref), to_categorical(y_va, 2), batch_size=args.batch, shuffle=False)
     elif args.train_strategy in ("jitter", "concat"):
-        # Fit standardizer on a single deterministic reference (native) then keep it fixed.
-        # This avoids leaking held-out families into statistics.
-        X_tr_nat = apply_mode(X_tr, "native")
-        mu, sd = fit_standardizer(X_tr_nat)
+        # For train-mode standardization, fit mu/sd on a single deterministic reference (native)
+        # and keep it fixed. This avoids leaking held-out families into statistics.
+        if args.standardize_mode == "train":
+            X_tr_nat = apply_mode(X_tr, "native")
+            mu, sd = fit_standardizer(X_tr_nat)
+        else:
+            mu, sd = None, None
         seq_tr = RefJitterSequence(
             X_tr,
             y_tr,
             batch_size=args.batch,
             ref_modes=train_modes,
+            ref_channel=args.ref_channel,
+            laplacian=need_neighbors,
+            keep_channels=",".join(list(CANON_CHS_18)),
             mu=mu,
             sd=sd,
-            ref_idx=ref_idx,
-            lap_neighbors=lap_neighbors,
             seed=args.seed,
             strategy=args.train_strategy,
+            standardize_mode=args.standardize_mode,
+            instance_robust=args.instance_robust,
         )
-        X_va_nat = apply_standardizer(apply_mode(X_va, "native"), mu, sd)
+        X_va_nat = apply_mode(X_va, "native")
+        if args.standardize_mode == "train":
+            X_va_nat = apply_standardizer(X_va_nat, mu, sd)
+        elif args.standardize_mode == "instance":
+            X_va_nat = standardize_instance(X_va_nat, robust=args.instance_robust)
         seq_va = ArraySequence(_reshape_for_model(X_va_nat), to_categorical(y_va, 2), batch_size=args.batch, shuffle=False)
     else:
         raise ValueError(f"Unknown train_strategy {args.train_strategy}")
@@ -250,8 +272,8 @@ def run_one_subject(args, subject: int) -> Dict:
         callbacks=callbacks,
     )
 
-    # Load best weights
-    if os.path.exists(ckpt_path):
+    # Load weights for evaluation
+    if args.eval_weights == "best" and os.path.exists(ckpt_path):
         model.load_weights(ckpt_path)
 
     # Evaluate across eval modes
@@ -267,14 +289,24 @@ def run_one_subject(args, subject: int) -> Dict:
         "metrics": {},
     }
 
-    # Use the same standardizer as training (for fixed it is fit on train_ref; for jitter it is native-fit).
-    if args.train_strategy == "fixed":
-        mu, sd = fit_standardizer(apply_mode(X_tr, args.train_mode))
+    # Standardizer used at eval time.
+    # - train   : recompute mu/sd on the training split under a leakage-safe deterministic ref
+    # - instance: apply per-trial standardization
+    # - none    : no standardization
+    if args.standardize_mode == "train":
+        if args.train_strategy == "fixed":
+            mu, sd = fit_standardizer(apply_mode(X_tr, args.train_mode))
+        else:
+            mu, sd = fit_standardizer(apply_mode(X_tr, "native"))
     else:
-        mu, sd = fit_standardizer(apply_mode(X_tr, "native"))
+        mu, sd = None, None
 
     for m in eval_modes:
-        X_te_m = apply_standardizer(apply_mode(X_te0, m), mu, sd)
+        X_te_m = apply_mode(X_te0, m)
+        if args.standardize_mode == "train":
+            X_te_m = apply_standardizer(X_te_m, mu, sd)
+        elif args.standardize_mode == "instance":
+            X_te_m = standardize_instance(X_te_m, robust=args.instance_robust)
         y_true = y_te0
         y_hat = model.predict(_reshape_for_model(X_te_m), batch_size=args.batch, verbose=0)
         y_pred = np.argmax(y_hat, axis=1)
@@ -309,7 +341,8 @@ def main():
     )
     ap.add_argument("--cache_root", default="", help="Optional MOABB cache root")
     ap.add_argument("--out_dir", default="outputs_multi")
-    ap.add_argument("--subject", type=int, default=1)
+    ap.add_argument("--subject", type=int, default=1, help="Single subject id (ignored if --subjects is set)")
+    ap.add_argument("--subjects", default="", help="Comma list of subjects to run (e.g. '1,2,3')")
     ap.add_argument("--split_mode", default="random", choices=["random", "session"])
     ap.add_argument("--train_frac", type=float, default=0.8)
     ap.add_argument("--val_frac", type=float, default=0.2)
@@ -330,6 +363,10 @@ def main():
     ap.add_argument("--eval_modes", default="", help="Comma list, default=all")
     ap.add_argument("--holdout_family", default="none", choices=["none", "native", "global", "local"])
     ap.add_argument("--ref_channel", default="Cz")
+
+    ap.add_argument("--standardize_mode", default="train", choices=["train", "instance", "none"], help="Standardization applied after referencing")
+    ap.add_argument("--instance_robust", action="store_true", help="Use median/MAD for instance standardization")
+    ap.add_argument("--eval_weights", default="best", choices=["best", "last"], help="Evaluate using best checkpoint or last epoch weights")
 
     # Model/training
     ap.add_argument("--epochs", type=int, default=200)
@@ -374,8 +411,29 @@ def main():
     expected = int(round((args.tmax - args.tmin) * args.resample_hz))
     args.in_samples = expected
 
-    res = run_one_subject(args, args.subject)
-    print(json.dumps(res, indent=2))
+    # Run one or many subjects
+    subs = []
+    if args.subjects.strip():
+        subs = [int(s) for s in args.subjects.split(",") if s.strip()]
+    else:
+        subs = [int(args.subject)]
+
+    all_res = []
+    for sub in subs:
+        r = run_one_subject(args, sub)
+        all_res.append(r)
+        print(json.dumps(r, indent=2))
+
+    # Lightweight aggregate (mean acc per eval mode across subjects)
+    if len(all_res) > 1:
+        agg = {"dataset": args.dataset, "subjects": subs, "mean_acc": {}}
+        modes = all_res[0]["metrics"].keys()
+        for m in modes:
+            agg["mean_acc"][m] = float(np.mean([x["metrics"][m]["acc"] for x in all_res]))
+        out_dir = os.path.join(args.out_dir, args.dataset)
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "aggregate_mean_acc.json"), "w") as f:
+            json.dump(agg, f, indent=2)
 
 
 if __name__ == "__main__":
