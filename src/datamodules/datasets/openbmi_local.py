@@ -44,6 +44,18 @@ def _extract_trials_from_openbmi_mat(mat_path: str):
     mat = loadmat(mat_path, simplify_cells=False)
     keys = [k for k in mat.keys() if not k.startswith("__")]
 
+    # Kaggle OpenBMI variant often stores BOTH train/test structs at the top-level.
+    # We'll treat a single .mat as "one session" and concatenate train+test trials
+    # within that session.
+    if "EEG_MI_train" in keys and "EEG_MI_test" in keys:
+        parts = []
+        for k in ["EEG_MI_train", "EEG_MI_test"]:
+            parts.append(_mat_to_dict(mat[k]))
+        # We'll fall through to the generic parsing below, but include these
+        # session-part dicts as primary candidates.
+    else:
+        parts = []
+
     # Common: an "EEG_MI" or "EEG_MI_train" struct
     preferred = ["EEG_MI", "EEG_MI_train", "EEG_MI_offline", "MI", "data"]
     root = None
@@ -53,8 +65,13 @@ def _extract_trials_from_openbmi_mat(mat_path: str):
             break
 
     candidates = []
+    # First try explicit train/test parts (if present)
+    for p in parts:
+        if isinstance(p, dict):
+            candidates.append(p)
     if isinstance(root, dict):
         candidates.append(root)
+    # Finally, a dict of all top-level keys
     candidates.append({k: _mat_to_dict(mat[k]) for k in keys})
 
     X = None
@@ -143,6 +160,50 @@ def _extract_trials_from_openbmi_mat(mat_path: str):
         lab = np.array(lab).squeeze()
         return pos, lab
 
+    def search_markers_everywhere() -> tuple[np.ndarray, np.ndarray] | None:
+        """Search for marker position+label pairs in likely places."""
+        # 1) y itself (if dict-like)
+        if isinstance(y, dict):
+            m = find_markers(y)
+            if m is not None:
+                return m
+        # 2) root dict
+        if isinstance(root, dict):
+            m = find_markers(root)
+            if m is not None:
+                return m
+            for mk in ["mrk", "marker", "markers", "event", "events", "cue", "trig", "trigger"]:
+                if mk in root and isinstance(root[mk], dict):
+                    m = find_markers(root[mk])
+                    if m is not None:
+                        return m
+        # 3) candidates (including EEG_MI_train/test parts)
+        for d in candidates:
+            if not isinstance(d, dict):
+                continue
+            m = find_markers(d)
+            if m is not None:
+                return m
+            for mk in ["mrk", "marker", "markers", "event", "events", "cue", "trig", "trigger"]:
+                if mk in d and isinstance(d[mk], dict):
+                    m = find_markers(d[mk])
+                    if m is not None:
+                        return m
+        # 4) nested: if we have top-level train/test, check inside them explicitly
+        for pk in ["EEG_MI_train", "EEG_MI_test"]:
+            if pk in keys:
+                obj = _mat_to_dict(mat[pk])
+                if isinstance(obj, dict):
+                    m = find_markers(obj)
+                    if m is not None:
+                        return m
+                    for mk in ["mrk", "marker", "markers", "event", "events", "cue", "trig", "trigger"]:
+                        if mk in obj and isinstance(obj[mk], dict):
+                            m = find_markers(obj[mk])
+                            if m is not None:
+                                return m
+        return None
+
     X_arr = np.array(X)
 
     # Case A: already epoched trials [N,C,T] in some permutation
@@ -177,32 +238,15 @@ def _extract_trials_from_openbmi_mat(mat_path: str):
         else:
             X_tc = X_arr
 
-        markers = None
-        if isinstance(y, dict):
-            markers = find_markers(y)
-        if markers is None and isinstance(root, dict):
-            for mk in ["mrk", "marker", "markers", "event", "events", "cue", "trig", "trigger"]:
-                if mk in root and isinstance(root[mk], dict):
-                    markers = find_markers(root[mk])
-                    if markers is not None:
-                        break
-        if markers is None:
-            for d in candidates:
-                if not isinstance(d, dict):
-                    continue
-                for mk in ["mrk", "marker", "markers", "event", "events", "cue", "trig", "trigger"]:
-                    if mk in d and isinstance(d[mk], dict):
-                        markers = find_markers(d[mk])
-                        if markers is not None:
-                            break
-                if markers is not None:
-                    break
+        markers = search_markers_everywhere()
 
         if markers is None:
             raise RuntimeError(
                 "OpenBMI .mat appears to contain continuous data but no recognizable marker structure. "
                 f"Path={mat_path}. Top-level keys={keys}. "
-                "Inspect the .mat with scipy.io.loadmat(..., simplify_cells=True) and adapt marker parsing."
+                "This Kaggle export often stores markers inside EEG_MI_train/EEG_MI_test structs. "
+                "Inspect the .mat with scipy.io.loadmat(..., simplify_cells=True) and look inside those structs "
+                "for fields like x, t/pos, and y/y_dec, then adapt marker parsing in openbmi_local.py."
             )
 
         pos, lab = markers
