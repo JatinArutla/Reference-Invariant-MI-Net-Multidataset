@@ -19,11 +19,41 @@ from typing import Optional, Tuple
 
 import os
 import numpy as np
+import re
 
 import mne
 
 from .base import BaseLRDataset, SplitSpec
 from ..channels import CANON_CHS_18
+def _normalize_physionet_ch_name(ch: str) -> str:
+    """Normalize Physionet channel labels to match CANON_CHS_18.
+
+    Physionet EDF channel names can come with prefixes/suffixes or odd casing, e.g.
+      - 'EEG FZ-REF', 'FZ', 'CZ', 'CPZ', 'PZ', 'FC3', ...
+    We strip common affixes and map Z channels to mixed-case ('Fz','Cz','CPz','Pz').
+    """
+    ch0 = str(ch).strip()
+    # Strip common prefixes
+    ch0 = re.sub(r"^EEG\s+", "", ch0, flags=re.IGNORECASE)
+    # Strip common suffixes like -REF, -LE, etc.
+    ch0 = re.sub(r"[-_](REF|LE|RE|A1|A2)$", "", ch0, flags=re.IGNORECASE)
+    # Remove spaces and trailing punctuation (Physionet EDF often has trailing '.' or '..')
+    ch0 = ch0.replace(" ", "")
+    ch0 = ch0.rstrip(".")
+    up = ch0.upper()
+
+    # Canonicalize Z channels to match our CANON18 mixed-case spelling
+    if up in ("FZ", "CZ", "PZ"):
+        return up[0] + "z"
+    if up == "CPZ":
+        return "CPz"
+
+    # Keep other 10-10 style names uppercase (FC1, C3, CP4, etc.)
+    # but preserve the conventional lowercase 'z' when present (FCz, AFz, POz, ...).
+    if up.endswith("Z") and not any(ch.isdigit() for ch in up):
+        # Examples: FCZ -> FCz, AFZ -> AFz
+        return up[:-1] + "z"
+    return up
 from ..transforms import bandpass_filter_trials, resample_trials
 
 
@@ -53,6 +83,11 @@ def _load_physionet_subject_left_right(root: str, subject: int, *, tmin: float, 
     except Exception:
         pass
 
+
+    # Normalize channel names so we can reliably match CANON18.
+    # Important: do this BEFORE epoching (events_from_annotations + Epochs).
+    raw.rename_channels(lambda ch: _normalize_physionet_ch_name(ch))
+
     raw.pick_types(eeg=True, eog=False, stim=False, ecg=False, emg=False, misc=False)
 
     # Events from EDF annotations
@@ -76,10 +111,19 @@ def _load_physionet_subject_left_right(root: str, subject: int, *, tmin: float, 
         verbose="ERROR",
     )
 
+    # Some EDF readers/montage operations can reintroduce odd casing/punctuation.
+    # Re-apply normalization at the Epochs level to make the channel contract robust.
+    epochs.rename_channels(lambda ch: _normalize_physionet_ch_name(ch))
+
     # Pick and order CANON18
     missing = [c for c in CANON_CHS_18 if c not in epochs.ch_names]
     if missing:
-        raise RuntimeError(f"Physionet subject {subject} missing CANON18 channels: {missing}")
+        # Provide a helpful debug snapshot
+        snap = epochs.ch_names[:30]
+        raise RuntimeError(
+            f"Physionet subject {subject} missing CANON18 channels: {missing}. "
+            f"First 30 available (post-normalize): {snap}"
+        )
     epochs = epochs.copy().pick_channels(list(CANON_CHS_18))
 
     X = epochs.get_data().astype(np.float32, copy=False)  # [N,C,T]
