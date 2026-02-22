@@ -88,7 +88,7 @@ def _load_physionet_subject_left_right(root: str, subject: int, *, tmin: float, 
     # Important: do this BEFORE epoching (events_from_annotations + Epochs).
     raw.rename_channels(lambda ch: _normalize_physionet_ch_name(ch))
 
-    raw.pick(eeg=True, eog=False, stim=False, ecg=False, emg=False, misc=False)
+    raw.pick(picks='eeg')
 
     # Events from EDF annotations
     events, event_id = mne.events_from_annotations(raw, verbose="ERROR")
