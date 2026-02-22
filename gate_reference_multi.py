@@ -176,6 +176,37 @@ def run_one_subject(args, subject: int) -> Dict:
         task=args.task,
     )
 
+    # ------------------------------------------------------------------
+    # Time-length contract
+    # ------------------------------------------------------------------
+    # ATCNet is built for a fixed number of time samples T.
+    # Some MNE/MOABB epochers use an inclusive tmax, yielding
+    #   T = (tmax - tmin) * fs + 1
+    # Our repo contract is
+    #   T = round((tmax - tmin) * fs)
+    # after any resampling.
+    def _fix_T(X: np.ndarray, target_T: int) -> np.ndarray:
+        if X.ndim != 3:
+            raise ValueError(f"Expected [N,C,T], got shape {X.shape}")
+        T = int(X.shape[-1])
+        if T == target_T:
+            return X
+        # Common off-by-one due to inclusive endpoint.
+        if T == target_T + 1:
+            return X[..., :target_T]
+        # Otherwise crop or pad deterministically (pad at the end).
+        if T > target_T:
+            return X[..., :target_T]
+        pad = target_T - T
+        return np.pad(X, ((0, 0), (0, 0), (0, pad)), mode="constant")
+
+    fs_eff = float(args.resample_hz) if args.resample_hz is not None else float(getattr(ds, "sfreq", 0.0) or 0.0)
+    if fs_eff > 0:
+        target_T = int(round((float(args.tmax) - float(args.tmin)) * fs_eff))
+        if target_T > 0:
+            X_tr0 = _fix_T(X_tr0, target_T)
+            X_te0 = _fix_T(X_te0, target_T)
+
     # Low-label
     X_tr0, y_tr0 = _label_frac(X_tr0, y_tr0, args.label_frac, seed=args.seed)
 
