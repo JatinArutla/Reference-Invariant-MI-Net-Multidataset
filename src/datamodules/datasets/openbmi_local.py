@@ -291,8 +291,27 @@ def _extract_trials_from_openbmi_mat(mat_path: str):
     # NOTE: OpenBMI channel names are well-formed strings, but we still normalize
     # to be robust to case/whitespace/unicode oddities across exports.
     if ch_list is not None and len(ch_list) == X_nct.shape[1]:
-        def _norm(s: str) -> str:
-            return str(s).strip().replace('​', '').replace('﻿', '').upper()
+        def _unbox(v):
+            """Unwrap MATLAB-ish singleton containers.
+
+            Some exports store channel names as object arrays or singleton lists,
+            which would stringify to "['FC1']" and break matching.
+            """
+            while True:
+                if isinstance(v, (list, tuple)) and len(v) == 1:
+                    v = v[0]
+                    continue
+                if isinstance(v, np.ndarray):
+                    arr = np.asarray(v)
+                    if arr.size == 1:
+                        v = arr.ravel()[0]
+                        continue
+                break
+            return v
+
+        def _norm(v) -> str:
+            v = _unbox(v)
+            return str(v).strip().replace('​', '').replace('﻿', '').upper()
 
         name_to_idx = {_norm(n): i for i, n in enumerate(ch_list)}
         req = [_norm(c) for c in CANON_CHS_18]
