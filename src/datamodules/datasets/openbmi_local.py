@@ -86,8 +86,8 @@ def _extract_trials_from_openbmi_mat(mat_path: str):
         return None
 
     for d in candidates:
-        X = try_get(d, ["x", "X", "cnt", "eeg", "EEG", "trial", "data"])
-        y = try_get(d, ["y", "Y", "label", "labels", "y_dec", "mrk"])
+        X = try_get(d, ["smt", "epo", "epoched", "trials", "trial", "x", "X", "cnt", "eeg", "EEG", "data"])
+        y = try_get(d, ["y_dec", "y_logic", "y", "Y", "label", "labels", "mrk"])
         ch_names = try_get(d, ["chan", "ch_names", "channels", "clab", "ch"])
         sfreq = try_get(d, ["fs", "srate", "sfreq", "sampling_rate"])
         if X is not None and y is not None:
