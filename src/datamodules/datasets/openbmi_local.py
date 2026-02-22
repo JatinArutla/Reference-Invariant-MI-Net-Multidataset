@@ -103,13 +103,43 @@ def _extract_trials_from_openbmi_mat(mat_path: str):
     # Channel names
     ch_list = None
     if ch_names is not None:
-        arr = np.array(ch_names)
-        if arr.dtype.kind in ("U", "S"):
-            ch_list = [str(c) for c in arr.reshape(-1)]
-        elif arr.dtype == object:
-            ch_list = [str(c).strip() for c in arr.reshape(-1)]
-        else:
-            ch_list = [str(c) for c in arr.reshape(-1)]
+        def _unbox(v):
+            """Unwrap MATLAB-ish singleton containers.
+
+            OpenBMI .mat exports vary a lot. Channel labels can arrive as:
+              - plain strings: 'FC1'
+              - 1-element numpy arrays: array(['FC1'], dtype='<U3')
+              - 1-element python lists/tuples: ['FC1']
+              - nested singletons of the above
+
+            If we stringify too early we end up with literal names like "['FC1']",
+            which breaks channel matching downstream.
+            """
+            while True:
+                if isinstance(v, (list, tuple)) and len(v) == 1:
+                    v = v[0]
+                    continue
+                if isinstance(v, np.ndarray):
+                    a = np.asarray(v)
+                    if a.size == 1:
+                        v = a.ravel()[0]
+                        continue
+                break
+            return v
+
+        def _clean_name(v) -> str:
+            v = _unbox(v)
+            s = str(v).strip()
+            # Common failure mode: already-stringified singleton container.
+            # Examples: "['FC1']", "[ 'FC1' ]", "[\"FC1\"]".
+            ss = s.strip()
+            if (ss.startswith("['") and ss.endswith("']")) or (ss.startswith('["') and ss.endswith('"]')):
+                ss = ss[2:-2]
+            s = ss.strip().strip('"').strip("'")
+            return s
+
+        arr = np.array(ch_names, dtype=object)
+        ch_list = [_clean_name(c) for c in arr.reshape(-1)]
 
     # sfreq
     try:
