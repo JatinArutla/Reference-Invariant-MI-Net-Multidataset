@@ -88,7 +88,7 @@ def _load_physionet_subject_left_right(root: str, subject: int, *, tmin: float, 
     # Important: do this BEFORE epoching (events_from_annotations + Epochs).
     raw.rename_channels(lambda ch: _normalize_physionet_ch_name(ch))
 
-    raw.pick_types(eeg=True, eog=False, stim=False, ecg=False, emg=False, misc=False)
+    raw.pick(eeg=True, eog=False, stim=False, ecg=False, emg=False, misc=False)
 
     # Events from EDF annotations
     events, event_id = mne.events_from_annotations(raw, verbose="ERROR")
@@ -124,7 +124,7 @@ def _load_physionet_subject_left_right(root: str, subject: int, *, tmin: float, 
             f"Physionet subject {subject} missing CANON18 channels: {missing}. "
             f"First 30 available (post-normalize): {snap}"
         )
-    epochs = epochs.copy().pick_channels(list(CANON_CHS_18))
+    epochs = epochs.copy().pick(list(CANON_CHS_18))
 
     X = epochs.get_data().astype(np.float32, copy=False)  # [N,C,T]
     # Labels based on events: map T1->0 (left), T2->1 (right)
