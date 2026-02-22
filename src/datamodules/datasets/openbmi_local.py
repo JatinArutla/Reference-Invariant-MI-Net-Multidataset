@@ -287,15 +287,24 @@ def _extract_trials_from_openbmi_mat(mat_path: str):
     # NOTE: X_nct, y_bin are defined in the branches above.
 
     # Reorder/select CANON18
+    #
+    # NOTE: OpenBMI channel names are well-formed strings, but we still normalize
+    # to be robust to case/whitespace/unicode oddities across exports.
     if ch_list is not None and len(ch_list) == X_nct.shape[1]:
-        name_to_idx = {str(n).strip(): i for i, n in enumerate(ch_list)}
-        missing = [c for c in CANON_CHS_18 if c not in name_to_idx]
+        def _norm(s: str) -> str:
+            return str(s).strip().replace('​', '').replace('﻿', '').upper()
+
+        name_to_idx = {_norm(n): i for i, n in enumerate(ch_list)}
+        req = [_norm(c) for c in CANON_CHS_18]
+        missing = [CANON_CHS_18[i] for i, rc in enumerate(req) if rc not in name_to_idx]
         if missing:
+            sample = list(sorted(list(name_to_idx.keys())))[:30]
             raise RuntimeError(
                 f"OpenBMI file missing CANON18 channels: {missing}. "
-                "Either change CANON_CHS_18 for this dataset, or provide a mapping."
+                f"First 30 available (normalized): {sample}. "
+                "Either change keep_channels for this dataset, or provide a mapping."
             )
-        idx = [name_to_idx[c] for c in CANON_CHS_18]
+        idx = [name_to_idx[rc] for rc in req]
         X_nct = X_nct[:, idx, :]
 
     meta = {"sfreq": sfreq_val, "channels": list(CANON_CHS_18), "source": os.path.basename(mat_path)}
