@@ -356,6 +356,9 @@ def _extract_trials_from_openbmi_mat(mat_path: str):
         idx = [name_to_idx[rc] for rc in req]
         X_nct = X_nct[:, idx, :]
 
+    # OpenBMI MI amplitudes in these .mat exports are in microvolts.
+    # Convert to volts so all loaders share the same numeric unit.
+    X_nct = X_nct.astype(np.float32, copy=False) * 1e-6
     meta = {"sfreq": sfreq_val, "channels": list(CANON_CHS_18), "source": os.path.basename(mat_path)}
     return X_nct, y_bin.astype(np.int64), meta
 

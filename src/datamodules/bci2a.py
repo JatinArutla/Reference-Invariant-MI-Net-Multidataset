@@ -43,7 +43,8 @@ def load_bci2a_session(
         for t in range(a_trial.size):
             if a_art[t] != 0 and not all_trials:
                 continue
-            seg = a_X[int(a_trial[t]) : int(a_trial[t]) + win_len, :n_channels].T  # [C, win_len]
+            # seg = a_X[int(a_trial[t]) : int(a_trial[t]) + win_len, :n_channels].T  # [C, win_len]
+            seg = a_X[int(a_trial[t]) : int(a_trial[t]) + win_len, :n_channels].T.astype(np.float32) * 1e-6  # convert µV -> V
             X[k] = seg
             y[k] = int(a_y[t])
             k += 1
