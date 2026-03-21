@@ -1,33 +1,50 @@
-"""Self-supervised pretraining for multi-dataset setup.
+"""Self-supervised pretraining for the multi-dataset benchmark.
 
-This is a thin adaptation of the single-dataset train_ssl.py to work with the
-multi-dataset loaders used by gate_reference_multi.py.
+This version fixes the original script's broken imports, bad SSL dataset call,
+multi-output encoder handling, and path / CLI incompatibilities.
 
-Output:
-  out_dir/<dataset>/subXXX/weights.h5
+Typical usage:
+  python train_ssl_multi.py \
+    --dataset iv2a \
+    --data_root /path/to/data \
+    --subject 1 \
+    --out_dir outputs/iv2a/sub001/ssl_refaug \
+    --view_mode ref+aug \
+    --view_ref_modes native,car,laplacian,bipolar,median \
+    --ssl_loss vicreg
 
-Those weights can be used as init for supervised training via:
-  gate_reference_multi.py --ssl_weights "<out_dir>/<dataset>/sub{sub:03d}/weights.h5"
+The saved weights can be used by gate_reference_multi.py via:
+  --ssl_weights <that out_dir>
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import json
+import os
+from pathlib import Path
+
+os.environ["TF_DISABLE_LAYOUT_OPTIMIZER"] = "1"
+os.environ["TF_DETERMINISTIC_OPS"] = "1"
+os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
+os.environ["TF_XLA_FLAGS"] = "--tf_xla_auto_jit=0"
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.optimizers import Adam
 
 from src.models.model import build_atcnet
+from src.models.wrappers import build_ssl_projector
 from src.datamodules.datasets import get_dataset
 from src.datamodules.datasets.base import SplitSpec
-from src.datamodules.channels import CANON_CHS_18, BCI2A_CH_NAMES
-from src.datamodules.transforms import apply_reference
-from src.datamodules.neighbors import neighbors_to_index_list
+from src.datamodules.channels import CANON_CHS_18, BCI2A_CH_NAMES, neighbors_to_index_list, name_to_index
+from src.datamodules.transforms import apply_reference, fit_standardizer, standardize_instance
 from src.selfsupervised.views import make_ssl_dataset
-from src.selfsupervised.losses import vicreg_loss, barlow_twins_loss, ntxent_loss
+from src.selfsupervised.losses import vicreg_loss, barlow_twins_loss, nt_xent_loss
 
 
 def set_seed(seed: int = 1):
@@ -38,22 +55,138 @@ def set_seed(seed: int = 1):
 
 
 def _reshape_for_model(X: np.ndarray) -> np.ndarray:
-    # [N,C,T] -> [N,1,C,T]
-    N, C, T = X.shape
-    return X.reshape(N, 1, C, T).astype(np.float32, copy=False)
+    n, c, t = X.shape
+    return X.reshape(n, 1, c, t).astype(np.float32, copy=False)
 
 
-def _compute_lap_neighbors() -> list[list[int]]:
-    return neighbors_to_index_list(
-        all_names=BCI2A_CH_NAMES,
-        keep_names=list(CANON_CHS_18),
-        sort_by_distance=True,
+def _to_b1ct(x: tf.Tensor) -> tf.Tensor:
+    return x if x.shape.rank == 4 else tf.expand_dims(x, 1)
+
+
+def _split_csv(s: str | None) -> list[str]:
+    if not s:
+        return []
+    return [p.strip() for p in s.split(",") if p.strip()]
+
+
+def _resolve_subject_out_dir(base_out_dir: str, dataset: str, subject: int) -> str:
+    subj_token = f"sub{subject:03d}"
+    parts = list(Path(base_out_dir).parts)
+    if subj_token in parts:
+        return str(Path(base_out_dir))
+    if dataset in parts:
+        return str(Path(base_out_dir) / subj_token)
+    return str(Path(base_out_dir) / dataset / subj_token)
+
+
+def _build_encoder(args) -> tf.keras.Model:
+    fuse = args.fuse
+    if fuse == "avg":
+        fuse = "average"
+    return build_atcnet(
+        n_classes=2,
+        in_chans=args.n_channels,
+        in_samples=args.in_samples,
+        n_windows=args.n_windows,
+        attention=args.attention,
+        eegn_F1=args.eegn_F1,
+        eegn_D=args.eegn_D,
+        eegn_kernel=args.eegn_kernel,
+        eegn_pool=args.eegn_pool,
+        eegn_dropout=args.eegn_dropout,
+        tcn_depth=args.tcn_depth,
+        tcn_kernel=args.tcn_kernel,
+        tcn_filters=args.tcn_filters,
+        tcn_dropout=args.tcn_dropout,
+        tcn_activation=args.tcn_activation,
+        fuse=fuse,
+        from_logits=False,
+        return_ssl_feat=True,
     )
+
+
+def _resolve_loss(args):
+    name = (args.ssl_loss or "vicreg").lower()
+    if name in ("nt_xent", "ntxent", "simclr"):
+        temperature = tf.constant(args.temperature, tf.float32)
+
+        def _loss(z1, z2):
+            return nt_xent_loss(z1, z2, temperature=temperature)
+
+        return _loss, True
+    if name in ("barlow", "barlow_twins"):
+
+        def _loss(z1, z2):
+            return barlow_twins_loss(z1, z2, lambd=float(args.barlow_lambda))
+
+        return _loss, False
+    if name == "vicreg":
+
+        def _loss(z1, z2):
+            return vicreg_loss(
+                z1,
+                z2,
+                sim_coeff=float(args.vicreg_sim),
+                std_coeff=float(args.vicreg_std),
+                cov_coeff=float(args.vicreg_cov),
+            )
+
+        return _loss, False
+    raise ValueError(f"Unknown ssl_loss: {args.ssl_loss}")
+
+
+def _resolve_ref_params(args, view_modes: list[str]):
+    ref_idx = None
+    need_ref = any((m or "").lower() in ("ref", "cz_ref", "channel_ref") for m in view_modes)
+    if need_ref:
+        ch_to_idx = name_to_index(list(CANON_CHS_18))
+        if args.ref_channel not in ch_to_idx:
+            raise ValueError(f"ref_channel '{args.ref_channel}' not in CANON_CHS_18")
+        ref_idx = ch_to_idx[args.ref_channel]
+
+    need_lap = args.laplacian or any(
+        (m or "").lower() in (
+            "laplacian", "lap", "local",
+            "bipolar", "bip", "bipolar_like",
+            "bipolar_edges", "bip_edges", "edges_bipolar",
+        )
+        for m in view_modes
+    )
+    lap_neighbors = (
+        neighbors_to_index_list(
+            all_names=BCI2A_CH_NAMES,
+            keep_names=list(CANON_CHS_18),
+            sort_by_distance=True,
+        )
+        if need_lap
+        else None
+    )
+    return ref_idx, lap_neighbors
+
+
+def _prepare_ssl_standardizer(args, X_tr: np.ndarray, *, view_mode: str, view_modes: list[str], ref_idx, lap_neighbors):
+    std_mode = (args.standardize_mode or "none").lower()
+    if std_mode == "none":
+        return None, None
+    if std_mode == "instance":
+        return None, None
+    if std_mode != "train":
+        raise ValueError("standardize_mode must be one of: train, instance, none")
+
+    vm = (view_mode or "aug").lower()
+    if vm in ("ref", "reference", "ref_only", "ref+aug", "ref_aug", "reference+aug"):
+        stats_pool = np.concatenate(
+            [apply_reference(X_tr, mode=m, ref_idx=ref_idx, lap_neighbors=lap_neighbors) for m in view_modes],
+            axis=0,
+        )
+    else:
+        stats_pool = X_tr
+    return fit_standardizer(stats_pool)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", required=True, choices=["iv2a", "openbmi_local", "physionet_local", "lee2019", "physionet"])
+    ap.add_argument("--dataset", required=True, choices=["iv2a", "openbmi_local", "physionet_local", "cho2017_local", "dreyer2023_local", "lee2019", "physionet"])
     ap.add_argument("--data_root", default="")
     ap.add_argument("--cache_root", default="")
     ap.add_argument("--out_dir", required=True)
@@ -61,29 +194,56 @@ def main():
     ap.add_argument("--split_mode", default="random", choices=["random", "session"])
     ap.add_argument("--train_frac", type=float, default=0.8)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--task", default="all", choices=["all", "lr", "4class"], help="Dataset task subset. For SSL, this only affects which trials are loaded before unlabeled pretraining.")
 
-    # Preprocessing contract
     ap.add_argument("--tmin", type=float, default=0.0)
     ap.add_argument("--tmax", type=float, default=3.0)
     ap.add_argument("--resample_hz", type=float, default=160.0)
     ap.add_argument("--band_lo", type=float, default=8.0)
     ap.add_argument("--band_hi", type=float, default=32.0)
 
-    # SSL views
     ap.add_argument("--view_mode", default="ref+aug", choices=["ref", "aug", "ref+aug"])
     ap.add_argument("--view_ref_modes", default="native,car,laplacian,bipolar,gs,median")
     ap.add_argument("--ref_channel", default="Cz")
     ap.add_argument("--laplacian", action="store_true")
-    ap.add_argument("--aug_policy", default="light", choices=["none", "light"])
+    ap.add_argument("--aug_policy", default="light", choices=["none", "light", "aggressive", "legacy"])
+    ap.add_argument("--standardize_mode", default="train", choices=["train", "instance", "none"])
+    ap.add_argument("--instance_robust", action="store_true")
 
-    # Training
     ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--batch", "--batch_size", dest="batch_size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--ssl_loss", default="vicreg", choices=["vicreg", "barlow", "ntxent"])
-    args = ap.parse_args()
+    ap.add_argument("--ssl_loss", default="vicreg", choices=["vicreg", "barlow", "ntxent", "nt_xent"])
+    ap.add_argument("--temperature", type=float, default=0.5)
+    ap.add_argument("--barlow_lambda", type=float, default=5e-3)
+    ap.add_argument("--vicreg_sim", type=float, default=25.0)
+    ap.add_argument("--vicreg_std", type=float, default=25.0)
+    ap.add_argument("--vicreg_cov", type=float, default=1.0)
 
+    ap.add_argument("--n_channels", type=int, default=len(CANON_CHS_18))
+    ap.add_argument("--in_samples", type=int, default=int(3.0 * 160.0))
+    ap.add_argument("--n_windows", type=int, default=5)
+    ap.add_argument("--attention", default="mha")
+    ap.add_argument("--eegn_F1", type=int, default=16)
+    ap.add_argument("--eegn_D", type=int, default=2)
+    ap.add_argument("--eegn_kernel", type=int, default=64)
+    ap.add_argument("--eegn_pool", type=int, default=8)
+    ap.add_argument("--eegn_dropout", type=float, default=0.3)
+    ap.add_argument("--tcn_depth", type=int, default=2)
+    ap.add_argument("--tcn_kernel", type=int, default=8)
+    ap.add_argument("--tcn_filters", type=int, default=32)
+    ap.add_argument("--tcn_dropout", type=float, default=0.3)
+    ap.add_argument("--tcn_activation", default="elu")
+    ap.add_argument("--fuse", default="average", choices=["average", "concat", "avg"])
+
+    # Compatibility no-ops for older notebook cells.
+    ap.add_argument("--keep_channels", default=",".join(CANON_CHS_18))
+    ap.add_argument("--no_ea", action="store_true")
+
+    args = ap.parse_args()
     set_seed(args.seed)
+
+    args.in_samples = int(round((args.tmax - args.tmin) * args.resample_hz))
 
     split = SplitSpec(mode=args.split_mode, train_frac=args.train_frac, seed=args.seed)
     ds = get_dataset(args.dataset, data_root=args.data_root or None)
@@ -96,111 +256,108 @@ def main():
         resample_hz=args.resample_hz,
         band=(args.band_lo, args.band_hi),
         cache_root=args.cache_root or None,
+        task=("all" if args.task == "4class" else args.task),
     )
 
-    # SSL uses unlabeled train set
-    ref_idx = list(CANON_CHS_18).index(args.ref_channel) if args.ref_channel in CANON_CHS_18 else 0
-    lap_neighbors = _compute_lap_neighbors() if args.laplacian else None
+    # Fix common off-by-one epoch length mismatch.
+    if X_tr.shape[-1] == args.in_samples + 1:
+        X_tr = X_tr[..., : args.in_samples]
+    elif X_tr.shape[-1] != args.in_samples:
+        if X_tr.shape[-1] > args.in_samples:
+            X_tr = X_tr[..., : args.in_samples]
+        else:
+            pad = args.in_samples - X_tr.shape[-1]
+            X_tr = np.pad(X_tr, ((0, 0), (0, 0), (0, pad)), mode="constant")
 
-    view_modes = [m.strip() for m in args.view_ref_modes.split(",") if m.strip()]
+    if X_tr.shape[1] != args.n_channels:
+        args.n_channels = int(X_tr.shape[1])
+
+    view_modes = _split_csv(args.view_ref_modes)
+    ref_idx, lap_neighbors = _resolve_ref_params(args, view_modes)
+    mu, sd = _prepare_ssl_standardizer(
+        args,
+        X_tr,
+        view_mode=args.view_mode,
+        view_modes=view_modes,
+        ref_idx=ref_idx,
+        lap_neighbors=lap_neighbors,
+    )
 
     ssl_ds = make_ssl_dataset(
         X_tr,
+        n_channels=args.n_channels,
+        in_samples=args.in_samples,
+        batch_size=args.batch_size,
+        shuffle=True,
+        seed=args.seed,
+        deterministic=True,
         view_mode=args.view_mode,
-        view_ref_modes=view_modes,
+        aug_policy=args.aug_policy,
+        ref_modes=view_modes,
         ref_idx=ref_idx,
         lap_neighbors=lap_neighbors,
-        aug_policy=args.aug_policy,
-        batch_size=args.batch,
-        seed=args.seed,
+        standardize_mode=args.standardize_mode,
+        mu=mu,
+        sd=sd,
+        instance_robust=args.instance_robust,
     )
 
-    # Encoder returning SSL features
-    encoder = build_atcnet(
-        n_classes=2,
-        in_chans=len(CANON_CHS_18),
-        in_samples=X_tr.shape[-1],
-        n_windows=5,
-        attention="mha",
-        eegn_F1=16,
-        eegn_D=2,
-        eegn_kernel=64,
-        eegn_pool=8,
-        eegn_dropout=0.3,
-        tcn_depth=2,
-        tcn_kernel=8,
-        tcn_filters=32,
-        tcn_dropout=0.3,
-        tcn_activation="elu",
-        fuse="avg",
-        from_logits=False,
-        return_ssl_feat=True,
-    )
-
-    # Simple projection head
-    feat_dim = int(encoder.output_shape[-1])
-    proj = tf.keras.Sequential(
-        [
-            tf.keras.layers.Dense(256, activation="relu"),
-            tf.keras.layers.Dense(128, activation=None),
-        ],
-        name="projector",
-    )
-
+    encoder = _build_encoder(args)
+    loss_fn, need_l2norm = _resolve_loss(args)
+    ssl_model = build_ssl_projector(encoder, proj_dim=128, out_dim=64, l2norm=need_l2norm)
     opt = Adam(args.lr)
 
-    if args.ssl_loss == "vicreg":
-        loss_fn = lambda a, b: vicreg_loss(a, b)
-    elif args.ssl_loss == "barlow":
-        loss_fn = lambda a, b: barlow_twins_loss(a, b)
-    elif args.ssl_loss == "ntxent":
-        loss_fn = lambda a, b: ntxent_loss(a, b)
-    else:
-        raise ValueError(f"Unknown ssl_loss: {args.ssl_loss}")
-
-    out_dir = os.path.join(args.out_dir, args.dataset, f"sub{args.subject:03d}")
-    os.makedirs(out_dir, exist_ok=True)
-    wpath = os.path.join(out_dir, "weights.h5")
-
-    @tf.function
+    @tf.function(reduce_retracing=True)
     def train_step(v1, v2):
         with tf.GradientTape() as tape:
-            z1 = encoder(v1, training=True)
-            z2 = encoder(v2, training=True)
-            p1 = proj(z1, training=True)
-            p2 = proj(z2, training=True)
-            loss = loss_fn(p1, p2)
-        vars_ = encoder.trainable_variables + proj.trainable_variables
-        grads = tape.gradient(loss, vars_)
-        opt.apply_gradients(zip(grads, vars_))
+            z1 = ssl_model(_to_b1ct(v1), training=True)
+            z2 = ssl_model(_to_b1ct(v2), training=True)
+            loss = loss_fn(z1, z2)
+        grads = tape.gradient(loss, ssl_model.trainable_variables)
+        grads_vars = [(g, v) for g, v in zip(grads, ssl_model.trainable_variables) if g is not None]
+        opt.apply_gradients(grads_vars)
         return loss
+
+    warm = next(iter(ssl_ds))
+    _ = train_step(warm[0], warm[1])
+
+    run_dir = _resolve_subject_out_dir(args.out_dir, args.dataset, args.subject)
+    os.makedirs(run_dir, exist_ok=True)
+    ssl_weights_path = os.path.join(run_dir, "weights.h5")
+    encoder_weights_path = os.path.join(run_dir, "encoder.weights.h5")
 
     for ep in range(1, args.epochs + 1):
         losses = []
-        for (v1, v2) in ssl_ds:
+        for v1, v2 in ssl_ds:
             losses.append(float(train_step(v1, v2).numpy()))
-        print(f"epoch {ep:03d}/{args.epochs} | loss={np.mean(losses):.4f}")
+        print(f"epoch {ep:03d}/{args.epochs} | ssl_loss={np.mean(losses):.4f}")
 
-    # Save weights (encoder+proj) so by_name loading can initialize shared layers.
-    # We save from a temporary model that includes both parts.
-    inp = tf.keras.Input(shape=(1, len(CANON_CHS_18), X_tr.shape[-1]))
-    tmp = tf.keras.Model(inp, proj(encoder(inp)))
-    tmp.save_weights(wpath)
+    ssl_model.save_weights(ssl_weights_path)
+    encoder.save_weights(encoder_weights_path)
 
     meta = {
         "dataset": args.dataset,
         "subject": args.subject,
+        "run_dir": os.path.abspath(run_dir),
+        "weights": {
+            "ssl_model": os.path.abspath(ssl_weights_path),
+            "encoder": os.path.abspath(encoder_weights_path),
+        },
         "view_mode": args.view_mode,
         "view_ref_modes": view_modes,
+        "standardize_mode": args.standardize_mode,
+        "instance_robust": bool(args.instance_robust),
         "band": [args.band_lo, args.band_hi],
         "resample_hz": args.resample_hz,
         "t": [args.tmin, args.tmax],
         "ssl_loss": args.ssl_loss,
+        "batch_size": args.batch_size,
     }
-    with open(os.path.join(out_dir, "meta.json"), "w") as f:
+    with open(os.path.join(run_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    print("Saved:", wpath)
+    print("Saved SSL weights:", ssl_weights_path)
+    print("Saved encoder weights:", encoder_weights_path)
 
 
 if __name__ == "__main__":

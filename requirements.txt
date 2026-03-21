@@ -12,3 +12,5 @@ mne>=1.6
 moabb>=1.1
 pandas>=2.0
 pooch>=1.8
+
+mne-bids>=0.15

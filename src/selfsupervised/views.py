@@ -1,7 +1,7 @@
 import numpy as np
 import tensorflow as tf
 
-from src.datamodules.transforms import apply_reference
+from src.datamodules.transforms import apply_reference, standardize_instance
 
 # -----------------------------------------------------------------------------
 # NumPy augmentations (input [C, T])
@@ -195,6 +195,36 @@ def two_reference_views(
 def _two_views_np(x: np.ndarray, aug_policy: str) -> tuple[np.ndarray, np.ndarray]:
     return two_random_augs(x, aug_policy=aug_policy)
 
+def _standardize_ssl_view(
+    x: np.ndarray,
+    *,
+    standardize_mode: str = "none",
+    mu: np.ndarray | None = None,
+    sd: np.ndarray | None = None,
+    instance_robust: bool = False,
+) -> np.ndarray:
+    mode = (standardize_mode or "none").lower()
+    if mode == "none":
+        return x.astype(np.float32, copy=False)
+    if mode == "instance":
+        return standardize_instance(x, robust=instance_robust).astype(np.float32, copy=False)
+    if mode == "train":
+        if mu is None or sd is None:
+            raise ValueError("mu and sd must be provided when standardize_mode='train'")
+        mu2 = np.asarray(mu, dtype=np.float32)
+        sd2 = np.asarray(sd, dtype=np.float32)
+        if mu2.ndim == 3:
+            mu2 = mu2[0]
+        if sd2.ndim == 3:
+            sd2 = sd2[0]
+        if mu2.ndim == 2 and mu2.shape[-1] == 1:
+            mu2 = mu2[:, 0:1]
+        if sd2.ndim == 2 and sd2.shape[-1] == 1:
+            sd2 = sd2[:, 0:1]
+        return ((x.astype(np.float32, copy=False) - mu2) / sd2).astype(np.float32, copy=False)
+    raise ValueError(f"Unknown standardize_mode: {standardize_mode}")
+
+
 def make_ssl_dataset(
     X: np.ndarray,
     *,
@@ -209,6 +239,10 @@ def make_ssl_dataset(
     ref_modes: list[str] | None = None,
     ref_idx: int | None = None,
     lap_neighbors: list[list[int]] | None = None,
+    standardize_mode: str = "none",
+    mu: np.ndarray | None = None,
+    sd: np.ndarray | None = None,
+    instance_robust: bool = False,
 ) -> tf.data.Dataset:
     N, C, T = X.shape
     assert C == n_channels and T == in_samples
@@ -218,20 +252,47 @@ def make_ssl_dataset(
     if shuffle:
         ds = ds.shuffle(buffer_size=N, seed=seed, reshuffle_each_iteration=True)
 
+    def _postprocess_pair(v1_np: np.ndarray, v2_np: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        v1_np = _standardize_ssl_view(
+            v1_np,
+            standardize_mode=standardize_mode,
+            mu=mu,
+            sd=sd,
+            instance_robust=instance_robust,
+        )
+        v2_np = _standardize_ssl_view(
+            v2_np,
+            standardize_mode=standardize_mode,
+            mu=mu,
+            sd=sd,
+            instance_robust=instance_robust,
+        )
+        return v1_np.astype(np.float32, copy=False), v2_np.astype(np.float32, copy=False)
+
     view_mode_l = (view_mode or "aug").lower()
     if view_mode_l in ("aug", "augs"):
-        mapper = lambda x: tf.numpy_function(lambda xx: _two_views_np(xx, aug_policy), [x], Tout=(tf.float32, tf.float32))
+        def _two_aug_std(x_np):
+            v1_np, v2_np = _two_views_np(x_np, aug_policy)
+            return _postprocess_pair(v1_np, v2_np)
+        mapper = lambda x: tf.numpy_function(_two_aug_std, [x], Tout=(tf.float32, tf.float32))
     elif view_mode_l in ("ref", "reference", "ref_only"):
         if not ref_modes:
             raise ValueError("ref_modes must be provided when view_mode='ref'")
         def _two_ref(x_np):
-            return two_reference_views(x_np, ref_modes=ref_modes, ref_idx=ref_idx, lap_neighbors=lap_neighbors, with_augs=False)
+            v1_np, v2_np = two_reference_views(
+                x_np,
+                ref_modes=ref_modes,
+                ref_idx=ref_idx,
+                lap_neighbors=lap_neighbors,
+                with_augs=False,
+            )
+            return _postprocess_pair(v1_np, v2_np)
         mapper = lambda x: tf.numpy_function(_two_ref, [x], Tout=(tf.float32, tf.float32))
     elif view_mode_l in ("ref+aug", "ref_aug", "reference+aug"):
         if not ref_modes:
             raise ValueError("ref_modes must be provided when view_mode='ref+aug'")
         def _two_ref_aug(x_np):
-            return two_reference_views(
+            v1_np, v2_np = two_reference_views(
                 x_np,
                 ref_modes=ref_modes,
                 ref_idx=ref_idx,
@@ -239,6 +300,7 @@ def make_ssl_dataset(
                 with_augs=True,
                 aug_policy=aug_policy,
             )
+            return _postprocess_pair(v1_np, v2_np)
         mapper = lambda x: tf.numpy_function(_two_ref_aug, [x], Tout=(tf.float32, tf.float32))
     else:
         raise ValueError(f"Unknown view_mode: {view_mode}")

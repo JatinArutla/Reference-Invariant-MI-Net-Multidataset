@@ -382,10 +382,10 @@ class OpenBMILocal(BaseLRDataset):
         resample_hz: Optional[float],
         band: Optional[Tuple[float, float]],
         cache_root: Optional[str] = None,
-        task: str = "lr",
+        task: str = "all",
     ):
-        if task != "lr":
-            raise ValueError("OpenBMI local loader in this repo supports only --task lr (binary left-vs-right).")
+        if task not in ("all", "lr"):
+            raise ValueError("OpenBMI local loader is binary in this repo. Use --task all or --task lr.")
         p1 = self._mat_path(subject, 1)
         p2 = self._mat_path(subject, 2)
         if not os.path.exists(p1) or not os.path.exists(p2):

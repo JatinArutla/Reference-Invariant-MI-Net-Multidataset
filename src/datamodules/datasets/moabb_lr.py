@@ -103,7 +103,11 @@ def _extract_left_right_from_moabb(dataset, subject: int, tmin: float, tmax: flo
 
 @dataclass
 class MOABBLR(BaseLRDataset):
-    """Binary left-vs-right wrapper around a MOABB dataset class."""
+    """Binary left-vs-right wrapper around a MOABB dataset class.
+
+    task="all" and task="lr" are equivalent here because the wrapped
+    MOABB datasets used in this repo are binary.
+    """
 
     dataset_ctor: object
     name: str
@@ -127,7 +131,10 @@ class MOABBLR(BaseLRDataset):
         resample_hz: Optional[float],
         band: Optional[Tuple[float, float]],
         cache_root: Optional[str] = None,
+        task: str = "all",
     ):
+        if task not in ("all", "lr", "4class"):
+            raise ValueError("This MOABB wrapper is binary in this repo. Use --task all or --task lr.")
         if cache_root:
             cached = _try_load_cache(cache_root, self.name, subject)
             if cached is not None:

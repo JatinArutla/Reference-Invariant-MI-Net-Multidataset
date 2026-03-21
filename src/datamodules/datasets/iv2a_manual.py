@@ -36,7 +36,7 @@ class IV2aManual(BaseLRDataset):
         resample_hz: Optional[float],
         band: Optional[Tuple[float, float]],
         cache_root: Optional[str] = None,
-        task: str = "lr",
+        task: str = "all",
     ):
         # Session split is fixed by dataset design: T=train, E=test.
         if split.mode not in ("session", "random"):
@@ -65,16 +65,14 @@ class IV2aManual(BaseLRDataset):
         )
 
         if task == "lr":
-            # Binary task: left(0) vs right(1)
             tr_mask = (y_tr == 0) | (y_tr == 1)
             te_mask = (y_te == 0) | (y_te == 1)
             X_tr, y_tr = X_tr[tr_mask], y_tr[tr_mask]
             X_te, y_te = X_te[te_mask], y_te[te_mask]
-        elif task == "4class":
-            # Keep all 4 classes (0..3) as returned by the loader.
+        elif task in ("all", "4class"):
             pass
         else:
-            raise ValueError(f"Unknown task='{task}'. Use 'lr' or '4class'.")
+            raise ValueError(f"Unknown task='{task}'. Use 'all'/'4class' or 'lr'.")
 
         # Optional preprocessing contract
         if band is not None:
