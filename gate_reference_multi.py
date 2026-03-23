@@ -647,7 +647,7 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--early_stop", action="store_true")
     ap.add_argument("--patience", type=int, default=20)
-    ap.add_argument("--verbose", type=int, default=1)
+    ap.add_argument("--verbose", type=int, default=0)
     ap.add_argument("--print_json", action="store_true")
     ap.add_argument("--ssl_weights", default=None)
 
