@@ -32,7 +32,6 @@ from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
     cohen_kappa_score,
-    confusion_matrix,
     f1_score,
     recall_score,
 )
@@ -55,6 +54,7 @@ from src.datamodules.array_sequence import ArraySequence
 from src.datamodules.datasets import get_dataset
 from src.datamodules.datasets.base import SplitSpec
 from src.datamodules.datasets.ref_families import all_ref_modes, train_modes_excluding_family
+from src.datamodules.datasets.protocol_defaults import HARMONIZED_BASELINE, get_protocol_preset
 
 
 tf.keras.backend.set_image_data_format("channels_last")
@@ -90,6 +90,52 @@ def print_avg_table(title: str, modes: list[str], row_name: str, accs: list[floa
     print(header)
     print("-" * len(header))
     print(_pretty_table_row(row_name, [a * 100.0 for a in accs]))
+
+
+def _band_arg(args):
+    if args.band_lo is None or args.band_hi is None:
+        return None
+    if float(args.band_lo) <= 0.0 or float(args.band_hi) <= 0.0:
+        return None
+    return (float(args.band_lo), float(args.band_hi))
+
+
+def _maybe_apply_protocol_presets(args):
+    preset = get_protocol_preset(args.dataset, args.protocol)
+    args.resolved_protocol_preset = None
+    if preset is None:
+        return
+
+    changed = {}
+
+    def maybe_set(attr: str, value, *, only_if_current=None):
+        if value is None:
+            return
+        cur = getattr(args, attr)
+        if only_if_current is not None and cur != only_if_current:
+            return
+        if cur != value:
+            setattr(args, attr, value)
+            changed[attr] = value
+
+    # Crop window defaults are the main safety fix.
+    maybe_set('tmin', preset.tmin, only_if_current=HARMONIZED_BASELINE.tmin)
+    maybe_set('tmax', preset.tmax, only_if_current=HARMONIZED_BASELINE.tmax)
+
+    # Only IV-2a native preset deliberately restores legacy-ish settings.
+    if (args.protocol or '').lower() == 'native' and (args.dataset or '').lower() == 'iv2a':
+        maybe_set('resample_hz', preset.resample_hz, only_if_current=HARMONIZED_BASELINE.resample_hz)
+        maybe_set('keep_channels', preset.keep_channels, only_if_current=','.join(CANON_CHS_18))
+        maybe_set('lr', preset.lr, only_if_current=HARMONIZED_BASELINE.lr)
+        maybe_set('eegn_pool', preset.eegn_pool, only_if_current=HARMONIZED_BASELINE.eegn_pool)
+        maybe_set('tcn_kernel', preset.tcn_kernel, only_if_current=HARMONIZED_BASELINE.tcn_kernel)
+        if args.band_lo == HARMONIZED_BASELINE.band_lo and args.band_hi == HARMONIZED_BASELINE.band_hi:
+            args.band_lo = 0.0
+            args.band_hi = 0.0
+            changed['band'] = None
+
+    if changed:
+        args.resolved_protocol_preset = changed
 
 
 def build_model(args) -> tf.keras.Model:
@@ -192,21 +238,7 @@ def _class_counts(y: np.ndarray) -> dict:
     u, c = np.unique(y, return_counts=True)
     return {int(uu): int(cc) for uu, cc in zip(u, c)}
 
-def _per_class_metric_dict(values: np.ndarray) -> dict:
-    values = np.asarray(values, dtype=np.float64)
-    return {int(i): float(v) for i, v in enumerate(values.tolist())}
-
-def _compute_eval_metrics(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int) -> dict:
-    labels = np.arange(n_classes, dtype=np.int64)
-    per_class_recall = recall_score(
-        y_true,
-        y_pred,
-        labels=labels,
-        average=None,
-        zero_division=0,
-    )
-    cm = confusion_matrix(y_true, y_pred, labels=labels)
-
+def _compute_eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     return {
         "acc": float(accuracy_score(y_true, y_pred)),
         "bal_acc": float(balanced_accuracy_score(y_true, y_pred)),
@@ -214,10 +246,6 @@ def _compute_eval_metrics(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int
         "kappa": float(cohen_kappa_score(y_true, y_pred)),
         "macro_recall": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
         "n": int(len(y_true)),
-        "class_counts_true": _class_counts(y_true),
-        "class_counts_pred": _class_counts(y_pred),
-        "per_class_recall": _per_class_metric_dict(per_class_recall),
-        "confusion_matrix": cm.astype(int).tolist(),
     }
 
 def _fix_T(X: np.ndarray, target_T: int) -> np.ndarray:
@@ -383,6 +411,8 @@ def _train_model(args, *, seq_tr, seq_va, subject: int, run_dir: str, monitor: s
 
 def run_one_subject(args, subject: int) -> Dict:
     ds = get_dataset(args.dataset, data_root=args.data_root or None)
+    if getattr(ds, "name", "") == "iv2a" and hasattr(ds, "keep_channels"):
+        ds.keep_channels = args.keep_channels
     split = SplitSpec(mode=args.split_mode, train_frac=args.train_frac, seed=args.seed)
     (X_tr0, y_tr0), (X_te0, y_te0) = ds.load_subject_native(
         subject,
@@ -390,7 +420,7 @@ def run_one_subject(args, subject: int) -> Dict:
         tmin=args.tmin,
         tmax=args.tmax,
         resample_hz=args.resample_hz,
-        band=(args.band_lo, args.band_hi),
+        band=_band_arg(args),
         cache_root=args.cache_root or None,
         task=args.task,
     )
@@ -533,9 +563,17 @@ def run_one_subject(args, subject: int) -> Dict:
         "label_frac": float(args.label_frac),
         "holdout_family": args.holdout_family,
         "standardize_mode": args.standardize_mode,
+        "protocol": args.protocol,
+        "resolved_protocol_preset": getattr(args, "resolved_protocol_preset", None),
         "ssl_loaded": ssl_loaded,
         "weights_used_for_eval": chosen_weights,
         "n_classes": int(args.n_classes),
+        "preprocessing": {
+            "t": [float(args.tmin), float(args.tmax)],
+            "resample_hz": float(args.resample_hz),
+            "band": _band_arg(args),
+            "keep_channels": args.keep_channels,
+        },
         "data": {
             "n_train": int(len(y_tr)),
             "n_val": int(len(y_va)),
@@ -558,7 +596,7 @@ def run_one_subject(args, subject: int) -> Dict:
         y_hat = model.predict(_reshape_for_model(X_te_m), batch_size=args.batch, verbose=0)
         y_pred = tf.nn.softmax(y_hat).numpy().argmax(axis=1) if args.from_logits else np.argmax(y_hat, axis=1)
 
-        metrics_m = _compute_eval_metrics(y_te0, y_pred, args.n_classes)
+        metrics_m = _compute_eval_metrics(y_te0, y_pred)
         results["metrics"][m] = metrics_m
 
     with open(os.path.join(run_dir, "results.json"), "w") as f:
@@ -583,6 +621,7 @@ def main():
     ap.add_argument("--label_frac", type=float, default=1.0)
 
     ap.add_argument("--task", default="all", choices=["all", "lr", "4class"], help="Task definition. all=dataset-native classes in this repo, lr=left-vs-right subset, 4class=iv2a alias for backward compatibility.")
+    ap.add_argument("--protocol", default="native", choices=["native", "harmonized"], help="native uses dataset-specific task-window presets. harmonized keeps the shared cross-dataset defaults.")
 
     ap.add_argument("--tmin", type=float, default=0.0)
     ap.add_argument("--tmax", type=float, default=3.0)
@@ -645,6 +684,10 @@ def main():
     elif args.task not in ("all", "lr"):
         raise ValueError(args.task)
 
+    _maybe_apply_protocol_presets(args)
+
+    if float(args.resample_hz) <= 0.0:
+        raise ValueError("resample_hz must be > 0. Use the dataset-native sampling rate instead of 0.")
     args.in_samples = int(round((args.tmax - args.tmin) * args.resample_hz))
 
     if args.subjects.strip():

@@ -43,6 +43,7 @@ from src.datamodules.datasets import get_dataset
 from src.datamodules.datasets.base import SplitSpec
 from src.datamodules.channels import CANON_CHS_18, BCI2A_CH_NAMES, neighbors_to_index_list, name_to_index
 from src.datamodules.transforms import apply_reference, fit_standardizer, standardize_instance
+from src.datamodules.datasets.protocol_defaults import HARMONIZED_BASELINE, get_protocol_preset
 from src.selfsupervised.views import make_ssl_dataset
 from src.selfsupervised.losses import vicreg_loss, barlow_twins_loss, nt_xent_loss
 
@@ -184,6 +185,50 @@ def _prepare_ssl_standardizer(args, X_tr: np.ndarray, *, view_mode: str, view_mo
     return fit_standardizer(stats_pool)
 
 
+def _band_arg(args):
+    if args.band_lo is None or args.band_hi is None:
+        return None
+    if float(args.band_lo) <= 0.0 or float(args.band_hi) <= 0.0:
+        return None
+    return (float(args.band_lo), float(args.band_hi))
+
+
+def _maybe_apply_protocol_presets(args):
+    preset = get_protocol_preset(args.dataset, args.protocol)
+    args.resolved_protocol_preset = None
+    if preset is None:
+        return
+
+    changed = {}
+
+    def maybe_set(attr: str, value, *, only_if_current=None):
+        if value is None:
+            return
+        cur = getattr(args, attr)
+        if only_if_current is not None and cur != only_if_current:
+            return
+        if cur != value:
+            setattr(args, attr, value)
+            changed[attr] = value
+
+    maybe_set('tmin', preset.tmin, only_if_current=HARMONIZED_BASELINE.tmin)
+    maybe_set('tmax', preset.tmax, only_if_current=HARMONIZED_BASELINE.tmax)
+
+    if (args.protocol or '').lower() == 'native' and (args.dataset or '').lower() == 'iv2a':
+        maybe_set('resample_hz', preset.resample_hz, only_if_current=HARMONIZED_BASELINE.resample_hz)
+        maybe_set('keep_channels', preset.keep_channels, only_if_current=','.join(CANON_CHS_18))
+        maybe_set('lr', preset.lr, only_if_current=HARMONIZED_BASELINE.lr)
+        maybe_set('eegn_pool', preset.eegn_pool, only_if_current=HARMONIZED_BASELINE.eegn_pool)
+        maybe_set('tcn_kernel', preset.tcn_kernel, only_if_current=HARMONIZED_BASELINE.tcn_kernel)
+        if args.band_lo == HARMONIZED_BASELINE.band_lo and args.band_hi == HARMONIZED_BASELINE.band_hi:
+            args.band_lo = 0.0
+            args.band_hi = 0.0
+            changed['band'] = None
+
+    if changed:
+        args.resolved_protocol_preset = changed
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True, choices=["iv2a", "openbmi_local", "physionet_local", "cho2017_local", "dreyer2023_local", "lee2019", "physionet"])
@@ -195,6 +240,7 @@ def main():
     ap.add_argument("--train_frac", type=float, default=0.8)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--task", default="all", choices=["all", "lr", "4class"], help="Dataset task subset. For SSL, this only affects which trials are loaded before unlabeled pretraining.")
+    ap.add_argument("--protocol", default="native", choices=["native", "harmonized"], help="native uses dataset-specific task-window presets. harmonized keeps the shared cross-dataset defaults.")
 
     ap.add_argument("--tmin", type=float, default=0.0)
     ap.add_argument("--tmax", type=float, default=3.0)
@@ -243,10 +289,16 @@ def main():
     args = ap.parse_args()
     set_seed(args.seed)
 
+    _maybe_apply_protocol_presets(args)
+
+    if float(args.resample_hz) <= 0.0:
+        raise ValueError("resample_hz must be > 0. Use the dataset-native sampling rate instead of 0.")
     args.in_samples = int(round((args.tmax - args.tmin) * args.resample_hz))
 
     split = SplitSpec(mode=args.split_mode, train_frac=args.train_frac, seed=args.seed)
     ds = get_dataset(args.dataset, data_root=args.data_root or None)
+    if getattr(ds, "name", "") == "iv2a" and hasattr(ds, "keep_channels"):
+        ds.keep_channels = args.keep_channels
 
     (X_tr, _y_tr), _ = ds.load_subject_native(
         args.subject,
@@ -254,7 +306,7 @@ def main():
         tmin=args.tmin,
         tmax=args.tmax,
         resample_hz=args.resample_hz,
-        band=(args.band_lo, args.band_hi),
+        band=_band_arg(args),
         cache_root=args.cache_root or None,
         task=("all" if args.task == "4class" else args.task),
     )
@@ -338,6 +390,8 @@ def main():
     meta = {
         "dataset": args.dataset,
         "subject": args.subject,
+        "protocol": args.protocol,
+        "resolved_protocol_preset": getattr(args, "resolved_protocol_preset", None),
         "run_dir": os.path.abspath(run_dir),
         "weights": {
             "ssl_model": os.path.abspath(ssl_weights_path),
@@ -347,7 +401,8 @@ def main():
         "view_ref_modes": view_modes,
         "standardize_mode": args.standardize_mode,
         "instance_robust": bool(args.instance_robust),
-        "band": [args.band_lo, args.band_hi],
+        "band": _band_arg(args),
+        "keep_channels": args.keep_channels,
         "resample_hz": args.resample_hz,
         "t": [args.tmin, args.tmax],
         "ssl_loss": args.ssl_loss,

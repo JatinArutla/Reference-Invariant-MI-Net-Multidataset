@@ -6,7 +6,6 @@ from typing import Optional, Tuple
 import numpy as np
 
 from ..bci2a import load_bci2a_session
-from ..channels import CANON_CHS_18
 from ..transforms import bandpass_filter_trials, resample_trials
 from .base import BaseLRDataset, SplitSpec
 
@@ -21,6 +20,7 @@ class IV2aManual(BaseLRDataset):
     data_root: str
     name: str = "iv2a"
     subject_list: list[int] = None
+    keep_channels: str = "canon18"
 
     def __post_init__(self):
         if self.subject_list is None:
@@ -42,7 +42,7 @@ class IV2aManual(BaseLRDataset):
         if split.mode not in ("session", "random"):
             raise ValueError(f"IV2aManual split.mode must be 'session' or 'random', got {split.mode}")
 
-        # Always load in native(as-released) reference and project to CANON18.
+        # Always load in native(as-released) reference. Channel subset/order is configurable.
         X_tr, y_tr = load_bci2a_session(
             self.data_root,
             subject,
@@ -50,7 +50,7 @@ class IV2aManual(BaseLRDataset):
             t1_sec=tmin,
             t2_sec=tmax,
             ref_mode="native",
-            keep_channels="canon18",
+            keep_channels=self.keep_channels,
             laplacian=False,
         )
         X_te, y_te = load_bci2a_session(
@@ -60,7 +60,7 @@ class IV2aManual(BaseLRDataset):
             t1_sec=tmin,
             t2_sec=tmax,
             ref_mode="native",
-            keep_channels="canon18",
+            keep_channels=self.keep_channels,
             laplacian=False,
         )
 
