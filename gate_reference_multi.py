@@ -32,6 +32,7 @@ from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
     cohen_kappa_score,
+    confusion_matrix,
     f1_score,
     recall_score,
 )
@@ -191,7 +192,21 @@ def _class_counts(y: np.ndarray) -> dict:
     u, c = np.unique(y, return_counts=True)
     return {int(uu): int(cc) for uu, cc in zip(u, c)}
 
-def _compute_eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+def _per_class_metric_dict(values: np.ndarray) -> dict:
+    values = np.asarray(values, dtype=np.float64)
+    return {int(i): float(v) for i, v in enumerate(values.tolist())}
+
+def _compute_eval_metrics(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int) -> dict:
+    labels = np.arange(n_classes, dtype=np.int64)
+    per_class_recall = recall_score(
+        y_true,
+        y_pred,
+        labels=labels,
+        average=None,
+        zero_division=0,
+    )
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+
     return {
         "acc": float(accuracy_score(y_true, y_pred)),
         "bal_acc": float(balanced_accuracy_score(y_true, y_pred)),
@@ -199,6 +214,10 @@ def _compute_eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
         "kappa": float(cohen_kappa_score(y_true, y_pred)),
         "macro_recall": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
         "n": int(len(y_true)),
+        "class_counts_true": _class_counts(y_true),
+        "class_counts_pred": _class_counts(y_pred),
+        "per_class_recall": _per_class_metric_dict(per_class_recall),
+        "confusion_matrix": cm.astype(int).tolist(),
     }
 
 def _fix_T(X: np.ndarray, target_T: int) -> np.ndarray:
@@ -539,7 +558,7 @@ def run_one_subject(args, subject: int) -> Dict:
         y_hat = model.predict(_reshape_for_model(X_te_m), batch_size=args.batch, verbose=0)
         y_pred = tf.nn.softmax(y_hat).numpy().argmax(axis=1) if args.from_logits else np.argmax(y_hat, axis=1)
 
-        metrics_m = _compute_eval_metrics(y_te0, y_pred)
+        metrics_m = _compute_eval_metrics(y_te0, y_pred, args.n_classes)
         results["metrics"][m] = metrics_m
 
     with open(os.path.join(run_dir, "results.json"), "w") as f:
