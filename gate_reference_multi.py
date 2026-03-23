@@ -28,7 +28,13 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
 import numpy as np
 import tensorflow as tf
-from sklearn.metrics import accuracy_score, cohen_kappa_score
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    cohen_kappa_score,
+    f1_score,
+    recall_score,
+)
 from sklearn.model_selection import StratifiedShuffleSplit
 from tensorflow.keras.callbacks import Callback, EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.losses import CategoricalCrossentropy
@@ -185,6 +191,15 @@ def _class_counts(y: np.ndarray) -> dict:
     u, c = np.unique(y, return_counts=True)
     return {int(uu): int(cc) for uu, cc in zip(u, c)}
 
+def _compute_eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    return {
+        "acc": float(accuracy_score(y_true, y_pred)),
+        "bal_acc": float(balanced_accuracy_score(y_true, y_pred)),
+        "macro_f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+        "kappa": float(cohen_kappa_score(y_true, y_pred)),
+        "macro_recall": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
+        "n": int(len(y_true)),
+    }
 
 def _fix_T(X: np.ndarray, target_T: int) -> np.ndarray:
     if X.ndim != 3:
@@ -523,9 +538,9 @@ def run_one_subject(args, subject: int) -> Dict:
         )
         y_hat = model.predict(_reshape_for_model(X_te_m), batch_size=args.batch, verbose=0)
         y_pred = tf.nn.softmax(y_hat).numpy().argmax(axis=1) if args.from_logits else np.argmax(y_hat, axis=1)
-        acc = float(accuracy_score(y_te0, y_pred))
-        kappa = float(cohen_kappa_score(y_te0, y_pred))
-        results["metrics"][m] = {"acc": acc, "kappa": kappa, "n": int(len(y_te0))}
+
+        metrics_m = _compute_eval_metrics(y_te0, y_pred)
+        results["metrics"][m] = metrics_m
 
     with open(os.path.join(run_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
@@ -625,14 +640,23 @@ def main():
         if args.print_json:
             print(json.dumps(r, indent=2))
         else:
-            acc0 = r["metrics"].get("native", {}).get("acc", None)
-            if acc0 is None:
-                acc0 = list(r["metrics"].values())[0]["acc"]
-            print(f"done: dataset={args.dataset} task={args.task} subject={sub} train={args.train_strategy}:{args.train_mode} native_acc={acc0*100.0:.2f}%")
+            native_metrics = r["metrics"].get("native", None)
+            if native_metrics is None:
+                native_metrics = list(r["metrics"].values())[0]
+
+            print(
+                f"done: dataset={args.dataset} task={args.task} subject={sub} "
+                f"train={args.train_strategy}:{args.train_mode} "
+                f"native_acc={native_metrics['acc']*100.0:.2f}% "
+                f"native_bal_acc={native_metrics['bal_acc']*100.0:.2f}% "
+                f"native_macro_f1={native_metrics['macro_f1']*100.0:.2f}%"
+            )
 
     if all_res:
         modes = list(all_res[0]["metrics"].keys())
         mean_acc = [float(np.mean([x["metrics"][m]["acc"] for x in all_res])) for m in modes]
+        mean_bal_acc = [float(np.mean([x["metrics"][m]["bal_acc"] for x in all_res])) for m in modes]
+        mean_macro_f1 = [float(np.mean([x["metrics"][m]["macro_f1"] for x in all_res])) for m in modes]
         row = args.train_strategy if args.train_strategy != "fixed" else args.train_mode
         title = f"Dataset={args.dataset} | task={args.task} | subjects={len(all_res)} | train={args.train_strategy}"
         print_avg_table(title, modes, row, mean_acc)
@@ -648,6 +672,8 @@ def main():
             "label_frac": float(args.label_frac),
             "holdout_family": args.holdout_family,
             "mean_acc": {m: a for m, a in zip(modes, mean_acc)},
+            "mean_bal_acc": {m: a for m, a in zip(modes, mean_bal_acc)},
+            "mean_macro_f1": {m: a for m, a in zip(modes, mean_macro_f1)},
         }
         agg_dir = _resolve_aggregate_out_dir(args.out_dir, args.dataset, subs)
         os.makedirs(agg_dir, exist_ok=True)
