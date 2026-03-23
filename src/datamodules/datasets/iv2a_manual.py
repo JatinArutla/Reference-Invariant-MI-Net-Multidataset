@@ -50,7 +50,7 @@ class IV2aManual(BaseLRDataset):
             t1_sec=tmin,
             t2_sec=tmax,
             ref_mode="native",
-            keep_channels=self.keep_channels,
+            keep_channels="canon18",
             laplacian=False,
         )
         X_te, y_te = load_bci2a_session(
@@ -60,7 +60,7 @@ class IV2aManual(BaseLRDataset):
             t1_sec=tmin,
             t2_sec=tmax,
             ref_mode="native",
-            keep_channels=self.keep_channels,
+            keep_channels="canon18",
             laplacian=False,
         )
 

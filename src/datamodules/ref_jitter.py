@@ -2,7 +2,7 @@ import numpy as np
 from tensorflow.keras.utils import Sequence
 
 from src.datamodules.transforms import apply_reference, standardize_instance
-from src.datamodules.channels import BCI2A_CH_NAMES, neighbors_to_index_list
+from src.datamodules.channels import BCI2A_CH_NAMES, neighbors_to_index_list, parse_keep_channels
 
 class RefJitterSequence(Sequence):
     def __init__(
@@ -41,8 +41,8 @@ class RefJitterSequence(Sequence):
         self.randref_alpha = float(randref_alpha)
 
         # keep_names in CURRENT order
-        keep_names = [c.strip() for c in keep_channels.split(",") if c.strip()] or None
-        self.current_names = keep_names if keep_names is not None else BCI2A_CH_NAMES
+        keep_idx = parse_keep_channels(keep_channels, all_names=BCI2A_CH_NAMES)
+        self.current_names = [BCI2A_CH_NAMES[i] for i in keep_idx] if keep_idx is not None else list(BCI2A_CH_NAMES)
 
         need_lap = laplacian or any(
             m in (

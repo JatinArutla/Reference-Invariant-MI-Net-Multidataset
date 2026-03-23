@@ -493,20 +493,20 @@ def run_one_subject(args, subject: int) -> Dict:
         if args.standardize_mode == "train":
             X_stats = np.concatenate([apply_mode(X_tr, m) for m in train_modes], axis=0)
             mu, sd = fit_standardizer(X_stats)
-        seq_tr = RefJitterSequence(
-            X_tr,
-            y_tr_oh,
-            batch_size=args.batch,
-            ref_modes=train_modes,
-            ref_channel=args.ref_channel,
-            laplacian=need_neighbors,
-            keep_channels=",".join(list(CANON_CHS_18)),
-            mu=mu,
-            sd=sd,
-            seed=args.seed,
-            standardize_mode=args.standardize_mode,
-            instance_robust=args.instance_robust,
-        )
+            seq_tr = RefJitterSequence(
+                X_tr,
+                y_tr_oh,
+                batch_size=args.batch,
+                ref_modes=train_modes,
+                ref_channel=args.ref_channel,
+                laplacian=need_neighbors,
+                keep_channels=args.keep_channels,
+                mu=mu,
+                sd=sd,
+                seed=args.seed,
+                standardize_mode=args.standardize_mode,
+                instance_robust=args.instance_robust,
+            )
         X_va_single = apply_mode(X_va, val_single_mode)
         X_va_fit = _apply_standardization(X_va_single, standardize_mode=args.standardize_mode, mu=mu, sd=sd, instance_robust=args.instance_robust)
         val_inputs_by_mode = {
@@ -652,7 +652,8 @@ def main():
     ap.add_argument("--ssl_weights", default=None)
 
     # Compatibility args from older notebook cells / single-dataset runner.
-    ap.add_argument("--keep_channels", default=",".join(CANON_CHS_18))
+    # ap.add_argument("--keep_channels", default=",".join(CANON_CHS_18))
+    ap.add_argument("--keep_channels", default="canon18")
     ap.add_argument("--laplacian", action="store_true")
     ap.add_argument("--no_ea", action="store_true")
 

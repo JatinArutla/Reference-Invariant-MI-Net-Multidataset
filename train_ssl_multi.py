@@ -41,7 +41,7 @@ from src.models.model import build_atcnet
 from src.models.wrappers import build_ssl_projector
 from src.datamodules.datasets import get_dataset
 from src.datamodules.datasets.base import SplitSpec
-from src.datamodules.channels import CANON_CHS_18, BCI2A_CH_NAMES, neighbors_to_index_list, name_to_index
+from src.datamodules.channels import CANON_CHS_18, BCI2A_CH_NAMES, neighbors_to_index_list, name_to_index, parse_keep_channels
 from src.datamodules.transforms import apply_reference, fit_standardizer, standardize_instance
 from src.datamodules.datasets.protocol_defaults import HARMONIZED_BASELINE, get_protocol_preset
 from src.selfsupervised.views import make_ssl_dataset
@@ -136,13 +136,20 @@ def _resolve_loss(args):
     raise ValueError(f"Unknown ssl_loss: {args.ssl_loss}")
 
 
+def _current_channel_names(args) -> list[str]:
+    keep_idx = parse_keep_channels(args.keep_channels, all_names=BCI2A_CH_NAMES)
+    return [BCI2A_CH_NAMES[i] for i in keep_idx] if keep_idx is not None else list(BCI2A_CH_NAMES)
+
+
 def _resolve_ref_params(args, view_modes: list[str]):
+    cur_names = _current_channel_names(args)
+
     ref_idx = None
     need_ref = any((m or "").lower() in ("ref", "cz_ref", "channel_ref") for m in view_modes)
     if need_ref:
-        ch_to_idx = name_to_index(list(CANON_CHS_18))
+        ch_to_idx = name_to_index(cur_names)
         if args.ref_channel not in ch_to_idx:
-            raise ValueError(f"ref_channel '{args.ref_channel}' not in CANON_CHS_18")
+            raise ValueError(f"ref_channel '{args.ref_channel}' not in current channel set")
         ref_idx = ch_to_idx[args.ref_channel]
 
     need_lap = args.laplacian or any(
@@ -156,7 +163,7 @@ def _resolve_ref_params(args, view_modes: list[str]):
     lap_neighbors = (
         neighbors_to_index_list(
             all_names=BCI2A_CH_NAMES,
-            keep_names=list(CANON_CHS_18),
+            keep_names=cur_names,
             sort_by_distance=True,
         )
         if need_lap
